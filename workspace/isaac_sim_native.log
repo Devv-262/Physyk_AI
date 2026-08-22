@@ -1,0 +1,47 @@
+═════════════════════════════════════════════════════════
+  Starting Native Isaac Sim 6.0.1 with WebRTC Streaming  
+  Public IP: 54.152.69.96                                  
+  Signaling Port: 49100 | Stream Port: 47998             
+═════════════════════════════════════════════════════════
+Loading user config located at: '/home/ubuntu/.local/share/ov/data/Kit/Isaac-Sim Streaming/6.0/user.config.json'
+2026-08-18T08:00:05Z [Info] [carb] Logging to file: /home/ubuntu/.nvidia-omniverse/logs/Kit/Isaac-Sim Streaming/6.0/kit_20260818_080005.log
+[0.194s] [ext: omni.kit.async_engine-0.0.3] startup
+[0.917s] [ext: omni.assets.plugins-0.0.0] startup
+[0.918s] [ext: omni.blobkey-1.1.2] startup
+[0.918s] [ext: omni.client.lib-1.1.1] startup
+[0.934s] [ext: omni.client-1.3.0] startup
+[0.937s] [ext: omni.protobuf.lib-1.0.0] startup
+[0.939s] [ext: omni.grpc.lib-1.0.0] startup
+[0.943s] [ext: omni.metrics.core-0.0.3] startup
+[0.943s] [ext: omni.datastore-0.0.0] startup
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1787040006.649788  541117 descriptor_database.cc:633] File already exists in database: grpc/health/v1/health.proto
+W0000 00:00:1787040006.649821  541117 message.cc:301] Protobuf GeneratedMessageFactory: File is already registered: grpc/health/v1/health.proto
+[0.944s] [ext: omni.gpu_foundation.shadercache.vulkan-1.0.0] startup
+[0.948s] [ext: omni.hsscclient-1.1.4] startup
+[0.949s] [ext: omni.stats-1.0.1] startup
+[0.950s] [ext: omni.ujitso.default-1.0.0] startup
+[0.954s] [ext: omni.gpu_foundation-0.0.0] startup
+[1.250s] [ext: carb.windowing.plugins-1.0.1] startup
+[1.250s] [ext: omni.kit.renderer.init-1.0.1] startup
+2026-08-18T08:00:06Z [1,231ms] [Warning] [omni.platforminfo.plugin] failed to open the default display.  Can't verify X Server version.
+
+|---------------------------------------------------------------------------------------------|
+| Driver Version: 595.91.07     | Graphics API: Vulkan
+|=============================================================================================|
+| GPU | Name                             | Active | LDA | GPU Memory | Vendor-ID | LUID       |
+|     |                                  |        |     |            | Device-ID | UUID       |
+|     |                                  |        |     |            | Bus-ID    |            |
+|---------------------------------------------------------------------------------------------|
+| 0   | NVIDIA RTX PRO 6000 Blackwell .. | Yes: 0 |     | 97887   MB | 10de      | 0          |
+|     |                                  |        |     |            | 2bb5      | 0f21aa70.. |
+|     |                                  |        |     |            | 2b        |            |
+|=============================================================================================|
+| OS: 22.04.5 LTS (Jammy Jellyfish) ubuntu, Version: 22.04.5, Kernel: 6.8.0-1061-aws
+| Processor: Intel(R) Xeon(R) Platinum 8559C
+| Cores: 4 | Logical Cores: 8
+|---------------------------------------------------------------------------------------------|
+| Total Memory (MB): 63764 | Free Memory: 56837
+| Total Page/Swap (MB): 0 | Free Page/Swap: 0
+|---------------------------------------------------------------------------------------------|
+2026-08-18T08:00:07Z [1,858ms] [Warning] [omni.rtx] ECC is enabled on physical device 0

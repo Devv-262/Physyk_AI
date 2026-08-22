@@ -1,0 +1,135 @@
+%%{init: {'flowchart': {'htmlLabels': true, 'curve': 'basis'}} }%%
+flowchart TD
+    %% ============================================================
+    %% Physyk — Agentic Orchestration Architecture
+    %% Sources: ARCHITECTURE.md (§1 service topology, §3 orchestration
+    %% loop, §5 state model) + agentic-plan.md (closed-loop requirements)
+    %% + cosmos_integration.md (perception/verification layer — planned,
+    %%   not yet reflected in ARCHITECTURE.md; behind PERCEPTION_MODE,
+    %%   default "stage" so it cannot yet change robot behaviour)
+    %%
+    %% Division of labour (per cosmos_integration.md "For Nithya" note):
+    %%   Nemotron        -> intent, sequencing, what tool to invoke next
+    %%   Cosmos Reason 2  -> what is physically happening / did it work
+    %%   Isaac Sim        -> exact coordinates, IK, execute
+    %% ============================================================
+
+    START(["Free-form instruction\n(GUI text box / WS)"]) --> UI["physyk_web_server.py\nGUI + WS log/plan view"]
+    UI -->|"POST instruction"| MAIN["physyk_main_server.py :7860\nAPI/WS gateway + camera proxy"]
+
+    MAIN --> CTRL{"plain control command?\nreset / home / randomize / 'vla:'"}
+    CTRL -->|yes| DIRECT["_forward_direct_to_isaac()\nsingle-shot, no LLM"]
+    DIRECT --> SIM
+
+    CTRL -->|no| LOCK{"_orchestrator_lock free?"}
+    LOCK -->|no, busy| BUSY(["reject:\norchestrator already running a plan"])
+    LOCK -->|yes| ORCH
+
+    subgraph AGENT["physyk_agent_orchestrator.py — NeMoRoboticsAgent.run() (background thread)"]
+        direction TB
+        ORCH["run(instruction)"] --> SCENE["fetch_live_scene()\nGET /state — real object positions,\nnot cached"]
+        SCENE --> DECOMP["decompose_task()\nPOST Nemotron /v1/chat/completions\nscene + subgoal-shape spec, temp=0"]
+        DECOMP --> PARSE["_parse_subgoals()\nstrip chain-of-thought,\ntake last JSON array"]
+        PARSE --> EMPTY{"subgoals\nempty / unparsable?"}
+        EMPTY -->|unparsable| FALLBACK["fallback: single 'direct' subgoal\n= dispatch instruction verbatim"]
+        EMPTY -->|"empty (no matching object)"| REJECT(["overall = REJECTED"])
+        EMPTY -->|no| LOOP
+        FALLBACK --> LOOP["for each subgoal, in order"]
+
+        subgraph STEP["Per-subgoal closed loop"]
+            direction TB
+            G1["validate_subgoal()\nPhysicalWorkspaceRails guardrail\nx:[0.20,0.70] y:[-0.45,0.45] z:[0.02,0.50]"]
+            G1 -->|fails| G1R(["REJECTED — skip step"])
+            G1 -->|passes| G2{"_subgoal_already_satisfied()?\ndeterministic position check"}
+            G2 -->|yes| DONE1(["DONE — skipped,\nno re-dispatch"])
+            G2 -->|no| G3{"_subgoal_drift_detected()?\nreference out of tray OR\nmoved since earlier verified step"}
+            G3 -->|drifted| DIAG1["request_failure_decision()\nNemotron diagnoses BEFORE dispatch"]
+            DIAG1 --> APPLY["apply decision:\nretry / replan_step /\nreplan_remaining (once/run) / proceed"]
+            APPLY --> DISPATCH
+            G3 -->|no drift| DISPATCH["subgoal_to_instruction()\n-> plain text instruction"]
+            DISPATCH --> PERCEP["PerceptionProvider.get_object_pose()\nmode=stage: USD lookup (today)\nmode=shadow: USD lookup + Cosmos\nlogged alongside, delta_mm on screen\nmode=vision: Cosmos pose drives IK,\nauto-fallback to stage on\ntimeout / sanity-gate miss"]
+            PERCEP --> EXEC["_dispatch(): POST /execute\nblock on /state.current_request_id\n== this request_id"]
+            EXEC --> WAIT["_wait_for_idle(): poll /state\nuntil busy=False, timeout=150s\n(timeout = FAILED, never silent success)"]
+            WAIT --> KIND{"subgoal.action\n== pick_place?"}
+            KIND -->|no| DONE2(["DONE"])
+            KIND -->|yes| VERIFY{"last_task_success == True?\n(real telemetry, §2 verification)"}
+            VERIFY -->|yes| VVERIFY["verify_step() — Cosmos visual check\n(planned add-on, enforce=True in vision mode)\ncamera frame -> 'is X now on/in Y?'\nerrors/timeouts fall back to verified=True,\nNOT CHECKED — never deadlocks the demo"]
+            VVERIFY -->|verified| DONE2
+            VVERIFY -->|"visual check failed\n(action looked done, wasn't)"| DIAG2
+            VERIFY -->|"no, attempts remain (max 3)"| DIAG2["request_failure_decision()\nsees error_mm, completed steps,\nremaining plan, live scene"]
+            DIAG2 -->|"retry / replan_step /\nreplan_remaining"| DISPATCH
+            VERIFY -->|"no, attempts exhausted"| FAIL1(["FAILED — abort remaining plan,\nmark later steps ABORTED"])
+        end
+
+        LOOP --> STEP
+        STEP -->|next subgoal| STEP
+        STEP -->|all subgoals processed| FINAL["Deterministic final-goal check\n(code only, no extra LLM call)\nre-compare every DONE step's final_pos\nagainst CURRENT live position"]
+
+        FINAL --> VERDICT{"overall verdict"}
+        VERDICT -->|"all done + goal holds"| SUCCESS(["SUCCESS"])
+        VERDICT -->|"later step disturbed\nan earlier one"| GNH(["GOAL_NOT_HELD"])
+        VERDICT -->|"some done, some failed"| PARTIAL(["PARTIAL"])
+        VERDICT -->|"none done"| FAILED(["FAILED"])
+    end
+
+    SUCCESS --> EMIT
+    GNH --> EMIT
+    PARTIAL --> EMIT
+    FAILED --> EMIT
+    REJECT --> EMIT
+    FAIL1 --> EMIT
+    EMIT["on_plan_update(plan)\nafter every state transition"] --> MAIN
+    MAIN -->|"WS broadcast sim_state.plan"| UI
+
+    %% ---- Tool layer (executors the orchestrator dispatches to) ----
+    SCENE -. "GET /state" .-> SIM
+    EXEC -. "POST /execute" .-> SIM
+    WAIT -. "poll GET /state" .-> SIM
+    DECOMP -. "POST /v1/chat/completions" .-> NEMO
+    DIAG1 -. "POST diagnose failure" .-> NEMO
+    DIAG2 -. "POST diagnose failure" .-> NEMO
+
+    subgraph COGNITIVE["Cognitive tool — Port 8000"]
+        NEMO["nemotron_fastapi_server.py\nvLLM, Nemotron-30B, OpenAI-compatible\n(decompose + diagnose only — never\ncalled for trivial status updates)"]
+    end
+
+    subgraph PHYSICS["Physics tool — Port 8100 (Isaac Sim process)"]
+        direction TB
+        SIM["isaac_sim_service.py\nsingle command_queue, one task at a time"]
+        SIM --> RESOLVE["resolve_pick_place_targets(instruction)\nkeyword-match objects + spatial relation"]
+        RESOLVE --> PPC["PickPlaceController\n10-phase grasp state machine\nreal PhysX + RMPFlow cspace"]
+        PPC --> TELEM["sim_telemetry:\nbusy, current_request_id,\nlast_task_success, last_task_error_mm"]
+    end
+
+    subgraph VLA["Alternate executor — Port 8300 (opt-in, 'vla:' prefix)"]
+        GROOT["groot_policy_service.py\nGR00T-N1.7-LIBERO — camera+EE pose\n-> action chunk (demo path, not default)"]
+    end
+
+    SIM -.->|"camera + EE pose"| GROOT
+
+    subgraph COSMOS["Perception/verification tool — Port 8001 (planned add-on, cosmos_integration.md)\nshares GPU with Nemotron (8000) + Isaac Sim renderer — vLLM util 0.60/0.14 split"]
+        direction TB
+        CCLIENT["cosmos_client.py\nCosmos-Reason2-2B, OpenAI-compatible\n/v1/chat/completions, ~150-400ms"]
+        CCLIENT --> DEPROJECT["deproject.py\npixel + depth -> world XYZ\n(overview cam: RGB + distance_to_image_plane)"]
+        DEPROJECT --> GATES["provider.py guardrails\n6s timeout, max_retries=0\nmedian-depth 11x11 patch\nworkspace AABB rejection\nsanity gate (default 8cm) -> stage fallback"]
+        CCLIENT --> STEPVER["step_verifier.py\n'is X now on/in Y?' post-condition\ncheck against fresh camera frame"]
+    end
+
+    PERCEP -. "grounds named object\n(shadow: logged only; vision: drives IK)" .-> CCLIENT
+    VVERIFY -. "post-motion visual check" .-> STEPVER
+    GATES -. "fallback pose\n(every failure path)" .-> SIM
+
+    %% ---- styling ----
+    classDef success fill:#1b5e20,stroke:#4caf50,color:#fff
+    classDef failure fill:#5d1a1a,stroke:#f44336,color:#fff
+    classDef warn fill:#5c4a10,stroke:#ffb300,color:#fff
+    classDef tool fill:#0d3b5c,stroke:#2196f3,color:#fff
+    classDef llm fill:#3a1c5c,stroke:#9c27b0,color:#fff
+    classDef vision fill:#0d5c4a,stroke:#00bfa5,color:#fff
+
+    class SUCCESS success
+    class GNH,PARTIAL,FAILED,FAIL1,BUSY,REJECT,G1R failure
+    class DONE1,DONE2 success
+    class NEMO,DIAG1,DIAG2,DECOMP llm
+    class SIM,RESOLVE,PPC,TELEM,GROOT tool
+    class CCLIENT,DEPROJECT,GATES,STEPVER,PERCEP,VVERIFY vision

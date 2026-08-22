@@ -1,0 +1,48 @@
+Create a clean, professional architecture diagram for a technical presentation slide, in a flat modern style (no 3D, no skeuomorphism, no clipart) — suitable for pasting directly into a PowerPoint slide with white or very light background.
+
+Title at top: "Physyk — Pick-and-Place Execution"
+
+Content to depict: A robotic pick-and-place system where a natural-language instruction splits into two parallel execution paths that both drive the same physical robot arm, then converge on one verification step.
+
+Layout — left to right, then converging downward:
+
+1. Leftmost box: "Instruction" (example text below it: "pick up the red cube and place it in the tray")
+2. From that box, two arrows branch outward to two horizontal lanes:
+
+Top lane — labeled "PickPlaceController — default, deterministic" (solid black boxes, solid arrows):
+- Box: "Keyword match — resolve_pick_place_targets()"
+- arrow →
+- Box: "10-phase grasp state machine (NVIDIA PickPlaceController)"
+- arrow →
+- Box: "RMPFlow cspace controller → joint targets"
+
+Bottom lane — labeled "GR00T-N1.7 VLA — experimental, opt-in (triggered by a 'vla:' prefix)" (dashed orange/amber boxes, dashed orange arrows, visually distinct from the top lane):
+- Box: "Camera frames (scene + wrist) + EE pose — observation"
+- arrow →
+- Box: "GR00T-N1.7-LIBERO policy (groot_policy_service.py, port 8300)"
+- arrow →
+- Box: "16-step action chunk (x, y, z, roll, pitch, yaw, gripper)"
+- A curved dashed arrow loops from this last box back to the first box in this lane, labeled "re-observe every chunk (max 4 chunks per task)" — this shows the closed-loop nature of the VLA path.
+
+3. Both lanes' final boxes have arrows pointing down into one shared wide box: "Franka Panda arm — PhysX @ 60Hz" (subtitle: "isaac_sim_service.py sim loop — shared by both paths")
+
+4. One more arrow down from that shared box into a final box: "Live position verification" (subtitle: "real sim telemetry compared to target — not a scripted PASS")
+
+Style notes:
+- Use a small legend at the bottom with 3 color swatches: solid gray/black = "default/deterministic path", dashed orange = "experimental VLA path (opt-in)", light gray = "shared physics execution"
+- Keep all text short — box titles under 5 words, subtitles under 10 words
+- Use consistent box sizing within each lane, aligned to a grid, generous whitespace, thin 1-2px borders, no drop shadows or gradients
+- Sans-serif font throughout (e.g., Helvetica/Inter style)
+- Landscape orientation, roughly 16:9, designed to fill a presentation slide
+
+---
+
+PPT SLIDE TEXT — Pick-and-Place (6-7 technical, defined lines)
+
+- Instruction Parsing: extracts the source object and destination target from natural-language commands.
+- Physics Simulation: executes robot motion using a Franka Panda arm in NVIDIA Isaac Sim, with real gravity, contact, and friction.
+- Deterministic Control: a validated 10-phase grasp-and-place state machine is the default execution path.
+- Motion Planning: RMPFlow generates collision-aware joint targets, routing the arm around registered obstacles.
+- Grasp Confirmation: gripper opening width is checked against a minimum threshold after closing, distinguishing a real grasp from closing on empty air.
+- Obstacle Handling: the target object (and, for stacking, the reference object) is temporarily disabled as an obstacle for the duration of its own task, then re-enabled on completion.
+- Outcome Verification: live simulator telemetry — object position and displacement — is compared against the resolved target to determine actual task success, not assumed success.
