@@ -1,0 +1,13 @@
+# secrets
+.env
+
+# environments / caches
+.venv/
+.isaac-cache/
+__pycache__/
+*.pyc
+
+# logs
+logs/
+*.log
+NvStreamer-*.etli
