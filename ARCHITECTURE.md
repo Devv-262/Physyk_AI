@@ -19,48 +19,57 @@ This doc covers two levels:
 
 ## 1. Service topology
 
-Four independent processes, talking over plain HTTP on localhost. Nothing here is a
-framework abstraction — every arrow below is a real `urllib`/`httpx` call.
+Everything runs on one laptop. Services talk over plain HTTP; nothing here is a framework
+abstraction — every arrow below is a real `urllib`/`httpx` call. Only the planner model is remote.
 
 ```mermaid
 flowchart LR
     subgraph Browser["Browser UI"]
-        UI["physyk_web_server.py\n(GUI, WebSocket log/plan view)"]
+        UI["physyk_main_server.py HTML\n(GUI, WebSocket log/plan view,\nPerception / Cosmos / Nemotron log pages)"]
     end
 
-    subgraph Bridge["Port 7860"]
+    subgraph Bridge["Port 7860 (.venv python)"]
         MAIN["physyk_main_server.py\nAPI/WS gateway + camera proxy"]
     end
 
-    subgraph Cognitive["Port 8000"]
-        NEMO["nemotron_fastapi_server.py\nvLLM, Nemotron-30B, OpenAI-compatible"]
+    subgraph Cognitive["NVIDIA hosted API"]
+        NEMO["Nemotron-3 Super 120B\nnvidia/nemotron-3-super-120b-a12b\n(integrate.api.nvidia.com/v1)"]
     end
 
-    subgraph Physics["Port 8100 — Isaac Sim process"]
-        SIM["isaac_sim_service.py\nPhysX + RMPFlow + PickPlaceController\nsingle command_queue, one task at a time"]
+    subgraph Vision["Port 8001 (Docker NIM)"]
+        COSMOS["Cosmos 3 Nano Reasoner 8B\nFP8, 8192 ctx, ~16 GB VRAM\nevidence only"]
     end
 
-    subgraph VLA["Port 8300"]
-        GROOT["groot_policy_service.py\nGR00T-N1.7-LIBERO checkpoint (opt-in, 'vla:' prefix)"]
+    subgraph Physics["Port 8100 (Docker: Isaac Sim 6.0.1)"]
+        SIM["isaac_sim_service.py\nPhysX + RMPFlow + PickPlaceController\ncameras + perception provider\nsingle command_queue, one task at a time"]
     end
 
     UI -- "instruction text / WS" --> MAIN
     MAIN -- "decompose + dispatch\n(physyk_agent_orchestrator.py)" --> NEMO
-    MAIN -- "/execute /state /reset /randomize\n(also camera MJPEG proxy)" --> SIM
-    SIM -- "camera + EE pose -> action chunk" --> GROOT
+    MAIN -- "/execute /state /reset /randomize\n/perception* (also camera MJPEG proxy)" --> SIM
+    MAIN -- "pre/post-step image checks" --> COSMOS
     MAIN -. "10Hz telemetry poll /state" .-> SIM
 ```
+
+**GR00T (port 8300) is parked** — not started, no GUI control, `vla:` prompts are rejected. The code
+(`groot_policy_service.py`, the sim's VLA client, the episode recorder) remains in the repo.
 
 **Key files by role:**
 
 | Role | File | Port |
 |---|---|---|
-| Gateway / GUI backend, camera proxy, WS broadcast | `physyk_main_server.py` | 7860 |
+| Gateway / GUI backend, camera proxy, WS broadcast, log pages | `physyk_main_server.py` | 7860 |
 | Agentic orchestrator (Nemotron client, guardrails, dispatch/verify loop) | `physyk_agent_orchestrator.py` | — (imported by main server) |
-| Nemotron-30B server (vLLM, OpenAI-compatible) | `nemotron_fastapi_server.py` | 8000 |
-| Isaac Sim physics + PickPlaceController + telemetry + camera streams | `isaac_sim_service.py` | 8100 |
-| GR00T-N1.7-LIBERO VLA inference server (separate venv) | `groot_policy_service.py` | 8300 |
+| Endpoints, keys, model names (env / `.env`) | `physyk_config.py` | — |
+| Isaac Sim physics + PickPlaceController + telemetry + cameras + perception wiring | `isaac_sim_service.py` | 8100 |
+| Perception: detector, provider, overlay layout | `physyk_perception/` | — (runs inside the sim) |
+| Cosmos client (grounding + visual Q&A) and step verifier | `physyk_perception/cosmos_client.py`, `step_verifier.py` | — |
+| Launchers | `run.sh`, `start_sim_docker.sh`, `start_cosmos_docker.sh` | — |
+| Parked GR00T VLA server | `groot_policy_service.py` | (8300, not started) |
 | Legacy/dead motion code (unreachable, candidate for deletion) | `physyk_lula_controller.py` | — |
+
+Isaac Sim runs in a container because the host OS (Ubuntu 26.04) is newer than Isaac Sim supports; Cosmos and
+Isaac Sim share one 24 GB GPU (~16 GB + ~4 GB). See `instructions.md`.
 
 ---
 
@@ -122,8 +131,8 @@ flowchart TD
     O2 --> Q
 ```
 
-**Notable engineering details baked into this path** (from `PLAN.md`, verified live —
-not aspirational):
+**Notable engineering details baked into this path** (each verified live during
+development — not aspirational):
 
 - Joints are PD-driven through real PhysX (`ArticulationAction`), not
   `set_joint_positions()` snapping — the earlier version bypassed physics entirely.
@@ -141,7 +150,14 @@ not aspirational):
   lets a caller confirm the sim actually started *this* dispatch (not stale telemetry
   from a previous or concurrent command) — see §4 below.
 
-**Alternate executor — GR00T-N1.7 VLA (`vla:` prefix, opt-in):** live camera + EE pose →
+**Where the coordinates come from — two modes (GUI switch).** Deterministic (default): object poses are
+read from the simulator's scene graph (`get_live_object_pos`). Pure perception: the same
+`resolve_pick_place_targets` runs, but every pose comes from the overview camera through
+`PerceptionProvider` (color masks + depth, table-plane self-calibrated), the tray is a fixed constant, and
+post-place verification is a fresh camera look. A cube the camera can't see is absent and the task is
+rejected. Nothing downstream of the poses differs. Full detail: `PERCEPTION.md`.
+
+**Alternate executor — GR00T-N1.7 VLA (`vla:` prefix — parked, not reachable from the GUI/backend):** live camera + EE pose →
 real forward pass on the LIBERO checkpoint (port 8300) → 16-step delta action chunk →
 RMPFlow execution, re-observing every chunk (max 4 chunks/task). Genuinely
 image-conditioned (verified: 3 different synthetic images → 3 different predicted
@@ -153,13 +169,14 @@ default path; VLA is a stretch/demo path, not what the orchestrator dispatches t
 ## 3. Agentic orchestration — Nemotron-driven plan → guardrail → dispatch → verify loop
 
 This is `physyk_agent_orchestrator.py`'s `NeMoRoboticsAgent.run()` — the actual
-hackathon deliverable per `PLAN.md` Part 2. It is a pure HTTP client of two already-
-running servers (Nemotron on 8000, Isaac Sim on 8100); no model is loaded in-process,
+agentic layer of the project. It is a pure HTTP client of two already-
+running services (the hosted Nemotron API, and Isaac Sim on 8100), plus Cosmos on 8001 for evidence; no
+model is loaded in-process,
 so it stays cheap to import into `physyk_main_server.py`'s plain-python3 process.
 
 ```mermaid
 flowchart TD
-    START(["free-form instruction arrives\nvia physyk_main_server.py execute_instruction()"]) --> CTRL{"plain control command?\n(reset/home/randomize/'vla:')"}
+    START(["free-form instruction arrives\nvia physyk_main_server.py execute_instruction()"]) --> CTRL{"plain control command?\n(reset/home/randomize)"}
     CTRL -- "yes" --> DIRECT["_forward_direct_to_isaac()\nsingle-shot, no LLM"]
     CTRL -- "no" --> LOCK{"_orchestrator_lock\nfree?"}
     LOCK -- "no" --> BUSY(["reject: orchestrator\nalready running a plan"])
@@ -242,6 +259,10 @@ Each design choice below closes a *specific, live-reproduced* bug — not a hypo
   own and the *original* compound goal can still be false if a later step (e.g. a
   stack) physically disturbed an earlier, already-verified placement. This check is
   pure position math against telemetry, deliberately not another LLM call.
+- **Guardrail retry on camera-derived scenes** (pure-perception mode) — a measured position can sit right
+  on a guardrail limit and fail once, then pass on the next look (this happened: a resting cube read
+  Z = 0.0196 against a 0.02 floor). The orchestrator re-observes and re-validates up to 3 times (0.8 s
+  apart) before rejecting. Skipped for the deterministic scene, where the coordinates are exact.
 
 ---
 
@@ -255,7 +276,7 @@ sequenceDiagram
     participant UI as GUI (physyk_web_server.py)
     participant MAIN as physyk_main_server.py :7860
     participant ORCH as NeMoRoboticsAgent (in-process)
-    participant NEMO as nemotron_fastapi_server.py :8000
+    participant NEMO as Nemotron (NVIDIA hosted API)
     participant SIM as isaac_sim_service.py :8100
 
     UI->>MAIN: POST instruction (WS or REST)
@@ -315,12 +336,20 @@ current_request_id, last_task_success, last_task_error_mm
 
 ---
 
-## 6. Known gaps (honest, per `PLAN.md`)
+## 6. Known gaps (honest)
 
-- GR00T-N1.7-LIBERO VLA path does real inference but does not reliably complete the
-  task on this scene (out-of-domain checkpoint, not fine-tuned here) — kept opt-in,
-  `PickPlaceController` is the default/reliable executor.
-- No N-trial randomized batch success-rate run yet (real verification only landed
-  recently — this is the natural next measurement).
-- `physyk_lula_controller.py` is confirmed dead code (unreachable legacy-namespace
-  bug) — candidate for deletion, not currently wired into any live path.
+- **GR00T VLA path is parked.** It did real inference but did not reliably complete the task on this scene
+  (out-of-domain checkpoint, not fine-tuned here). `PickPlaceController` is the reliable executor; the
+  camera-only pipeline (`PERCEPTION.md`) is the current vision-driven alternative.
+- **Pure perception is scoped to the three colored cubes** on the known table with the studio lighting; the
+  tray is a fixed constant. Lower cubes in a stack are less precise (~8-9 mm in synthetic tests).
+- **Speed:** the pick controller counts phases per loop iteration, so wall time is set by the loop rate. It was ~6
+  iterations/s (~2 min per pick) because every camera was rendered twice per frame; skipping the duplicate
+  `rep.orchestrator.step()` and dropping two of the five cameras (three remain: overview, front, wrist) brought it
+  to ~40/s (~25 s per pick, ~90 s for a 3-cube stack). Raising the motion speed factor to 1.875 (from 1.25) failed
+  to pick reliably and is reverted (`PHYSYK_SPEEDUP` overrides it), and physics-only sub-stepping does not work in
+  this Isaac Sim build. On battery the laptop GPU is power-capped and everything slows ~2-3x — keep it plugged in.
+- No N-trial randomized batch success-rate run yet (single runs and one full 3-cube stack verified).
+- Cosmos is not started/stopped by `run.sh` (use `start_cosmos_docker.sh`).
+- `physyk_lula_controller.py` is confirmed dead code (unreachable legacy-namespace bug) — candidate for
+  deletion, not wired into any live path.

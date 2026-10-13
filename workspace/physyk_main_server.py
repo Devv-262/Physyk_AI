@@ -15,6 +15,7 @@ import json
 import time
 import asyncio
 import threading
+import subprocess
 import math
 import base64
 import urllib.request
@@ -60,10 +61,9 @@ else:
     print("[Physyk] Non-agentic mode (PHYSYK_AGENTIC=0) — instructions dispatch directly "
           "to Isaac Sim, no Nemotron orchestrator.")
 
-ISAAC_SIM_URL = "http://localhost:8100"
-NEMOTRON_URL = "http://localhost:8000"
-COSMOS_URL = "http://localhost:8001"
-GROOT_SERVER_URL = "http://localhost:8300"
+import physyk_config as cfg
+
+ISAAC_SIM_URL = cfg.ISAAC_SIM_URL
 
 app = FastAPI(title="Physyk Franka Panda AI Control")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -73,8 +73,51 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # only 7860/8211 are actually forwarded through Brev/VS Code (see BREV_PORT_CONFIG.md) — a
 # separate port would work over plain localhost but 404/fail to connect for anyone reaching
 # this dashboard remotely, which is exactly what happened with the first version of this.
-from reasoning_dashboard import mount_reasoning_routes
+from reasoning_dashboard import mount_reasoning_routes, custom_pages
 mount_reasoning_routes(app)
+
+
+def _render_perception_log_page() -> str:
+    """/reasoning/perception — what the overview camera detected, with the annotated frame
+    (bounding boxes + estimated XYZ) for every pre-pick detection and post-place check. The
+    data lives in the Isaac Sim process; images are proxied via /perception_log/<id>.jpg."""
+    import html as _html
+    try:
+        req = urllib.request.Request(f"{ISAAC_SIM_URL}/perception/log", headers={"User-Agent": "Physyk-Bridge"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            entries = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return f"<h1 style='font-family:monospace;color:#f87171'>Isaac Sim unreachable: {_html.escape(str(e))}</h1>"
+    rows = []
+    for e in entries:
+        lines = []
+        for key, o in (e.get("objects") or {}).items():
+            name = key.replace("_", " ").title()
+            if o.get("seen"):
+                x, y, z = o["camera_xyz_m"]
+                lines.append(f"{name}: seen at ({x:.3f}, {y:.3f}, {z:.3f}) m"
+                             + (f", yaw {o['yaw_deg']}°" if o.get("yaw_deg") is not None else "")
+                             + (f" — scoring error vs sim {o['score_error_mm']} mm" if o.get("score_error_mm") is not None else ""))
+            else:
+                lines.append(f"{name}: NOT SEEN")
+        rows.append(f"""<div class="entry">
+          <div class="meta"><span class="t">{e['t']}</span> <span class="label">{_html.escape(e['event'])}</span></div>
+          <div class="text">{_html.escape(e.get('note',''))}\n{_html.escape(chr(10).join(lines))}</div>
+          <img class="frame" src="/perception_log/{e['id']}.jpg">
+        </div>""")
+    body = "".join(rows) or '<div class="empty">No perception events yet — switch on the perception toggle and run a pick-and-place.</div>'
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>Perception — Log</title><style>
+ body {{ background:#0a0c10; color:#e5e7eb; font-family:'JetBrains Mono',ui-monospace,monospace; margin:0; padding:24px; }}
+ h1 {{ color:#f59e0b; font-size:1.1rem; margin:0 0 16px; }}
+ .entry {{ border-left:3px solid #f59e0b; background:rgba(255,255,255,0.03); padding:10px 14px; margin-bottom:12px; border-radius:0 6px 6px 0; }}
+ .meta {{ font-size:0.7rem; color:#9ca3af; margin-bottom:4px; }} .label {{ font-weight:700; color:#f59e0b; }}
+ .text {{ font-size:0.82rem; line-height:1.5; white-space:pre-wrap; }} .empty {{ color:#6b7280; font-style:italic; }}
+ .frame {{ display:block; margin-top:8px; max-width:100%; width:720px; border-radius:6px; border:1px solid rgba(255,255,255,0.12); }}
+</style></head><body><h1>Perception — camera detections (overview camera, color segmentation + depth)</h1>{body}</body></html>"""
+
+
+custom_pages["perception"] = _render_perception_log_page
 
 connected_ws: list = []
 broadcast_lock = threading.Lock()
@@ -95,7 +138,7 @@ sim_state = {
     # decompose/guardrail/retry/replan transitions as they happen, not just prose lines.
     "plan": None,
     "agentic_mode": AGENTIC_MODE,
-    # Cosmos-Reason2 shadow-mode perception snapshot (cosmos_integration.md Step 6) — the
+    # Cosmos shadow-mode perception snapshot (cosmos_integration.md Step 6) — the
     # last grounding call's stage-vs-vision delta per object. Purely informational: nothing
     # in sim_state or the dispatch path reads this to make a decision.
     "perception": None,
@@ -118,7 +161,6 @@ sim_state = {
         "isaac_sim": False,
         "nemotron": False,
         "cosmos": False,
-        "groot": False,
     },
 }
 
@@ -164,8 +206,6 @@ def poll_isaac_sim_state():
                     sim_state["busy"] = data.get("busy", False)
                     sim_state["last_instruction"] = data.get("last_instruction", sim_state["last_instruction"])
                     sim_state["fps"] = data.get("fps", 60.0)
-                    sim_state["vla_reasoning"] = data.get("vla_reasoning")
-                    sim_state["vla_chunks_done"] = data.get("vla_chunks_done")
                     sim_state["isaac_connected"] = True
         except Exception:
             sim_state["isaac_connected"] = False
@@ -189,9 +229,12 @@ def poll_isaac_sim_state():
 state_sync_thread = threading.Thread(target=poll_isaac_sim_state, daemon=True)
 state_sync_thread.start()
 
-def _url_is_healthy(url: str, timeout: float = 1.5) -> bool:
+def _url_is_healthy(url: str, timeout: float = 5.0, api_key: str = "") -> bool:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Physyk-Bridge"})
+        headers = {"User-Agent": "Physyk-Bridge"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
@@ -205,11 +248,31 @@ def poll_service_status():
     indicators for a dashboard, not something anything else in the app reads to make a
     decision, so there's no reason to poll them at telemetry speed."""
     while True:
-        sim_state["service_status"]["isaac_sim"] = sim_state["isaac_connected"]
-        sim_state["service_status"]["nemotron"] = _url_is_healthy(f"{NEMOTRON_URL}/health")
-        sim_state["service_status"]["cosmos"] = _url_is_healthy(f"{COSMOS_URL}/v1/models")
-        sim_state["service_status"]["groot"] = _url_is_healthy(f"{GROOT_SERVER_URL}/health")
-        time.sleep(5.0)
+        # Hosted NVIDIA API (or a local OpenAI-compatible server): "online" = the /models
+        # listing answers with our key. Slow poll — every call is a real network round trip.
+        sim_state["service_status"]["nemotron"] = _url_is_healthy(f"{cfg.NEMOTRON_BASE_URL}/models", api_key=cfg.NEMOTRON_API_KEY)
+        sim_state["service_status"]["cosmos"] = _url_is_healthy(f"{cfg.COSMOS_BASE_URL}/models", api_key=cfg.COSMOS_API_KEY)
+        time.sleep(30.0)
+
+SIM_CONTAINER_NAME = os.environ.get("PHYSYK_SIM_CONTAINER", "physyk-isaac-sim")
+
+def _sim_container_running() -> bool:
+    """True if the Isaac Sim docker container (start_sim_docker.sh) is running — it counts as ONLINE even while the
+    sim inside is still loading and port 8100 does not answer yet."""
+    try:
+        out = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", SIM_CONTAINER_NAME],
+                             capture_output=True, text=True, timeout=3)
+        return out.returncode == 0 and out.stdout.strip() == "true"
+    except Exception:
+        return False
+
+def poll_isaac_status():
+    """Isaac Sim pill: ONLINE if its docker container is running OR its API answers (a windowed/native run)."""
+    while True:
+        sim_state["service_status"]["isaac_sim"] = bool(sim_state["isaac_connected"]) or _sim_container_running()
+        time.sleep(3.0)
+
+threading.Thread(target=poll_isaac_status, daemon=True).start()
 
 service_status_thread = threading.Thread(target=poll_service_status, daemon=True)
 service_status_thread.start()
@@ -262,8 +325,6 @@ _CONTROL_KEYWORDS = ("reset", "home", "park", "retract", "randomize", "shuffle")
 
 def _is_control_command(instruction: str) -> bool:
     inst = instruction.strip().lower()
-    if inst.startswith("vla:") or inst.startswith("vla "):
-        return True
     return any(inst == kw or inst.startswith(kw + " ") or inst == f"go {kw}" for kw in _CONTROL_KEYWORDS)
 
 def _on_plan_update(plan: dict):
@@ -291,6 +352,10 @@ def execute_instruction(instruction: str):
     (camera streaming, /state polling for the GUI). Falls back to the direct single-shot path
     if the orchestrator isn't available, or if the "Send to Agent" switch is off."""
     push_log(f"Command received: '{instruction}'", "INFO")
+
+    if instruction.strip().lower().startswith(("vla:", "vla ")):
+        push_log("The GR00T VLA path is disabled in this build — ignoring 'vla:' command.", "WARN")
+        return {"status": "rejected", "instruction": instruction, "error": "VLA disabled"}
 
     if not AI_STACK_AVAILABLE or not agent_enabled or _is_control_command(instruction):
         return _forward_direct_to_isaac(instruction)
@@ -333,18 +398,6 @@ async def proxy_scene_stream():
 async def proxy_scene_stream_alias():
     return await proxy_mjpeg_stream("/camera/stream")
 
-@app.get("/camera/front.stream")
-async def proxy_front_stream():
-    return await proxy_mjpeg_stream("/camera/front.stream")
-
-@app.get("/camera/side.stream")
-async def proxy_side_stream():
-    return await proxy_mjpeg_stream("/camera/side.stream")
-
-@app.get("/camera/top.stream")
-async def proxy_top_stream():
-    return await proxy_mjpeg_stream("/camera/top.stream")
-
 @app.get("/camera/wrist.stream")
 async def proxy_wrist_stream():
     return await proxy_mjpeg_stream("/camera/wrist.stream")
@@ -363,9 +416,6 @@ def get_cameras_api():
     return {
         "cameras": [
             {"id": "scene", "name": "3rd Person Isometric Overview", "stream": "/camera/stream"},
-            {"id": "front", "name": "Front Operator View", "stream": "/camera/front.stream"},
-            {"id": "side", "name": "Side Profile & Height Clearance", "stream": "/camera/side.stream"},
-            {"id": "top", "name": "Top-Down Bird's Eye Planar", "stream": "/camera/top.stream"},
             {"id": "wrist", "name": "Wrist Camera (Gripper Close-up)", "stream": "/camera/wrist.stream"},
         ]
     }
@@ -407,7 +457,7 @@ async def proxy_lighting(req: Request):
 
 @app.post("/reset")
 def proxy_reset():
-    push_log("Reset requested — homing arm, returning cubes to staging spots...", "INFO")
+    push_log("Reset requested — homing arm, returning objects to staging spots...", "INFO")
     try:
         req = urllib.request.Request(f"{ISAAC_SIM_URL}/reset", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=2.0) as resp:
@@ -430,7 +480,7 @@ def hard_reset():
       2. Isaac Sim's own physics loop, which may be mid-motion on a pick_place or VLA task
          dispatched either by the orchestrator or directly — via isaac_sim_service.py's own
          /hard_stop, which drops whatever's active, homes the arm, and resets every cube."""
-    push_log("HARD RESET — stopping any active plan/task, homing the arm, and resetting cubes...", "WARN")
+    push_log("HARD RESET — stopping any active plan/task, homing the arm, and resetting objects...", "WARN")
 
     if AI_STACK_AVAILABLE:
         try:
@@ -469,7 +519,7 @@ def hard_reset():
 
 @app.post("/randomize")
 def proxy_randomize():
-    push_log("Randomizing cube positions (genuinely random, arm-reachable, tray-clear)...", "INFO")
+    push_log("Randomizing object positions (genuinely random, arm-reachable)...", "INFO")
     try:
         req = urllib.request.Request(f"{ISAAC_SIM_URL}/randomize", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=2.0) as resp:
@@ -477,6 +527,37 @@ def proxy_randomize():
     except Exception as e:
         push_log(f"Randomize request failed: {e}", "WARN")
         return {"status": "error", "message": str(e)}
+
+@app.get("/perception_log/{entry_id}.jpg")
+def perception_log_image(entry_id: int):
+    try:
+        req = urllib.request.Request(f"{ISAAC_SIM_URL}/perception/log/{entry_id}.jpg", headers={"User-Agent": "Physyk-Bridge"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            return Response(content=resp.read(), media_type="image/jpeg")
+    except Exception:
+        return Response(status_code=404)
+
+@app.post("/perception_mode")
+async def perception_mode(req: Request):
+    """The "Drive arm from camera" switch: flips Isaac Sim's perception provider between
+    'shadow' (deterministic — simulator ground-truth poses drive the arm) and 'vision'
+    (pure perception: camera-derived poses only, no simulator coordinates, no fallback). Live,
+    no restart; takes effect on the next dispatched pick/place."""
+    body = await req.json()
+    mode = "pure" if body.get("vision") else "shadow"
+    try:
+        preq = urllib.request.Request(
+            f"{ISAAC_SIM_URL}/perception/mode",
+            data=json.dumps({"mode": mode}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(preq, timeout=5.0) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        push_log(f"Perception switch: arm is now driven by "
+                 f"{'CAMERA ONLY (pure perception — no simulator coordinates)' if mode == 'pure' else 'simulator ground truth (deterministic)'}.", "INFO")
+        return {"status": "ok", "mode": result.get("mode", mode)}
+    except Exception as e:
+        push_log(f"Could not switch perception mode: {e}", "WARN")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=502)
 
 @app.post("/agent_toggle")
 async def agent_toggle(req: Request):
@@ -832,7 +913,7 @@ HTML = """<!DOCTYPE html>
     <div class="status-pill" id="modePill" title="Whether instructions go through the Nemotron agentic orchestrator (decompose/guardrail/verify/retry) or straight to Isaac Sim as typed.">
       <span class="pill-icon" id="modePillIcon"></span><span id="modePillText">—</span>
     </div>
-    <div class="status-pill" id="perceptionPill" title="Cosmos-Reason2-2B vision perception mode. Stage/shadow: ground-truth pose drives the robot, Cosmos runs alongside and only logs a delta. Vision: Cosmos's own estimate drives the robot (with automatic fallback to ground truth on failure).">
+    <div class="status-pill" id="perceptionPill" title="Cosmos 3 Nano Reasoner vision perception mode. Stage/shadow: ground-truth pose drives the robot, Cosmos runs alongside and only logs a delta. Vision: Cosmos's own estimate drives the robot (with automatic fallback to ground truth on failure).">
       <span class="pill-icon"><svg class="icon-sm" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg></span><span id="perceptionPillText">PERCEPTION —</span>
     </div>
     <div class="status-pill">
@@ -844,9 +925,9 @@ HTML = """<!DOCTYPE html>
     <div class="svc-pill svc-offline" id="svc-isaac_sim"><span class="svc-dot"></span><span class="svc-label">Isaac Sim</span><span class="svc-state">—</span></div>
     <div class="svc-pill svc-offline" id="svc-nemotron"><span class="svc-dot"></span><span class="svc-label">Nemotron</span><span class="svc-state">—</span></div>
     <div class="svc-pill svc-offline" id="svc-cosmos"><span class="svc-dot"></span><span class="svc-label">Cosmos</span><span class="svc-state">—</span></div>
-    <div class="svc-pill svc-offline" id="svc-groot"><span class="svc-dot"></span><span class="svc-label">GR00T VLA</span><span class="svc-state">—</span></div>
     <a href="/reasoning/nemotron" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Full, un-truncated Nemotron reasoning log">🧠 Nemotron Log</a>
-    <a href="/reasoning/cosmos" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Full, un-truncated Cosmos-Reason2 perception log">👁️ Cosmos Log</a>
+    <a href="/reasoning/cosmos" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Full, un-truncated Cosmos perception log">👁️ Cosmos Log</a>
+    <a href="/reasoning/perception" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Camera detections with annotated frames: bounding boxes and estimated XYZ for every pre-pick detection and post-place check (pure-perception mode)">🎯 Perception Log</a>
   </div>
 </header>
 
@@ -860,9 +941,6 @@ HTML = """<!DOCTYPE html>
           <span><svg class="icon" viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/></svg> Live Viewport</span>
           <select id="cameraSelector" class="vp-select">
             <option value="scene">3rd Person (Isometric Overview)</option>
-            <option value="front">Front View (Operator Facing)</option>
-            <option value="side">Side Profile (Depth &amp; Height)</option>
-            <option value="top">Top-Down (Bird's Eye Planar)</option>
             <option value="wrist">Wrist Camera (Gripper Close-up)</option>
           </select>
           <span class="vp-badge" id="feedStatus">HTTP Stream</span>
@@ -924,10 +1002,10 @@ HTML = """<!DOCTYPE html>
     <!-- Prompt Panel -->
     <div class="prompt-panel">
       <div class="section-title">Physical AI Instruction</div>
-      <textarea id="promptInput" class="prompt-box" placeholder="e.g., Pick up the red cube and place it into the tray..."></textarea>
+      <textarea id="promptInput" class="prompt-box" placeholder="Tell the robot what to do..."></textarea>
       <div class="btn-row">
         <button class="btn btn-primary" id="btnExecute" onclick="sendInstruction()"><svg class="icon" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></svg> Execute in Sim</button>
-        <button class="btn btn-danger" id="btnHardReset" onclick="sendHardReset()" title="Immediately stop any running prompt or agentic plan, clear it, send the arm home, and return every cube to its default staging spot."><svg class="icon" viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg> Hard Reset</button>
+        <button class="btn btn-danger" id="btnHardReset" onclick="sendHardReset()" title="Immediately stop any running prompt or agentic plan, clear it, send the arm home, and return all objects to its default staging spot."><svg class="icon" viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg> Hard Reset</button>
       </div>
       <div class="agent-switch-row" title="When on, prompts are decomposed/guardrailed/verified/retried by the Nemotron agentic orchestrator. When off, prompts go straight to Isaac Sim exactly as typed — no agent involved.">
         <label class="switch">
@@ -936,33 +1014,35 @@ HTML = """<!DOCTYPE html>
         </label>
         <span class="agent-switch-label" id="agentSwitchLabel">Send prompt to Agent</span>
       </div>
+      <div class="agent-switch-row" id="perceptionSwitchRow" title="Off: the arm goes to the simulator's exact object positions (deterministic). On: PURE PERCEPTION — object positions come only from the overview camera (color segmentation + depth); the arm never sees simulator coordinates, and nothing falls back to them. If the camera cannot see an object the task is rejected. Takes effect on the next pick-and-place.">
+        <label class="switch">
+          <input type="checkbox" id="perceptionSwitch" onchange="togglePerception()">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+        <span class="agent-switch-label" id="perceptionSwitchLabel">Deterministic — sim positions</span>
+      </div>
     </div>
 
     <!-- Quick Tasks -->
     <div class="quick-cmds">
       <div class="section-title">Quick Action Tasks</div>
       <div class="cmd-grid">
-        <div class="cmd-card" onclick="sendRandomize()" style="border-color: rgba(245,158,11,0.35);" title="Places all 3 cubes at genuinely random positions (np.random, not a fixed list) anywhere within the arm's reach, clear of the tray.">
+        <div class="cmd-card" onclick="sendRandomize()" style="border-color: rgba(245,158,11,0.35);" title="Places all 3 cubes at genuinely random positions (np.random, not a fixed list) within the arm's reach, clear of the tray.">
           <span class="cmd-swatch" style="background:#f59e0b;"></span>
-          <span><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/></svg> Randomize Cube Positions</span>
+          <span><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/></svg> Randomize Objects Positions</span>
         </div>
-        <div class="cmd-card" onclick="runQuick('Return robot arm to home configuration')" title="Moves only the robot arm — cube positions are left exactly where they are.">
+        <div class="cmd-card" onclick="runQuick('Return robot arm to home configuration')" title="Moves only the robot arm — object positions are left exactly where they are.">
           <span class="cmd-swatch" style="background:#7e879a;"></span>
           <span>Return to Home Pose (arm only)</span>
         </div>
         <div class="cmd-card" onclick="sendReset()" style="border-color: rgba(34,211,238,0.3);">
           <span class="cmd-swatch" style="background:#22d3ee;"></span>
-          <span>Full Reset — Cubes to Fixed Spots + Home</span>
-        </div>
-        <div class="cmd-card" onclick="runQuick('vla: pick up the red cube and place it in the tray')" style="border-color: rgba(139,92,246,0.35);" title="Real closed-loop GR00T-N1.7 inference (camera + language -> action) driving the arm directly, instead of the deterministic PickPlaceController. Not fine-tuned on this scene, so it may not complete the task &#8212; this exercises the real model loop, not scripted motion.">
-          <span class="cmd-swatch" style="background:#8b5cf6;"></span>
-          <span><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/><path d="M4 9h2M4 15h2M18 9h2M18 15h2M9 4v2M15 4v2M9 18v2M15 18v2"/></svg> Try Real GR00T VLA (experimental)</span>
+          <span>Full Reset — Objects to Fixed Spots + Home</span>
         </div>
       </div>
       <p style="font-size:0.72rem; color:var(--muted); margin-top:10px; line-height:1.5;">
-        Type your own instructions above — e.g. "pick up the green cube and place it in the tray".
-        There's no per-color shortcut button anymore; the model has to actually find the cube
-        you asked for, wherever it randomly ended up.
+        Type your own instructions above. There are no shortcut buttons for tasks: the model has to actually find
+        the objects you asked for, wherever they ended up.
       </p>
     </div>
 
@@ -972,12 +1052,11 @@ HTML = """<!DOCTYPE html>
       <div id="planBox">
         <div class="plan-empty">No plan running — type an instruction above.</div>
       </div>
-      <div id="vlaReasoningBox" class="plan-step-detail" style="display:none; margin-top:10px; padding:8px; border-left:2px solid #a78bfa; background:rgba(167,139,250,0.06);"></div>
     </div>
 
-    <!-- Cosmos-Reason2 shadow-mode perception (cosmos_integration.md Step 6) -->
+    <!-- Cosmos shadow-mode perception (cosmos_integration.md Step 6) -->
     <div class="plan-panel">
-      <div class="section-title"><svg class="icon" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg> Vision Perception (Cosmos-Reason2)</div>
+      <div class="section-title"><svg class="icon" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg> Vision Perception (overview camera)</div>
       <div id="perceptionBox">
         <div class="plan-empty">No perception snapshot yet — run an instruction.</div>
       </div>
@@ -989,9 +1068,6 @@ HTML = """<!DOCTYPE html>
       <div style="display:flex; flex-direction:column; gap:6px;">
         <div class="api-row"><span>3rd Person Isometric Stream</span><a data-path="/camera/stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>In-Hand Wrist Camera Stream</span><a data-path="/camera/wrist.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Front Operator View Stream</span><a data-path="/camera/front.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Side Profile View Stream</span><a data-path="/camera/side.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Top-Down Bird's Eye Stream</span><a data-path="/camera/top.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>Live Joint State JSON</span><a data-path="/state" target="_blank">View /state <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>System Health JSON</span><a data-path="/health" target="_blank">View /health <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>Vision Perception JSON</span><a data-path="/perception" target="_blank">View /perception <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
@@ -1066,7 +1142,7 @@ HTML = """<!DOCTYPE html>
     REJECTED: '<svg class="icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M6 6l12 12"/></svg>',
     ABORTED: '<svg class="icon-sm" viewBox="0 0 24 24"><path d="M6 12h12"/></svg>',
   };
-  // Cosmos-Reason2 visual step-verification evidence (cosmos_integration.md Step 7) — a
+  // Cosmos visual step-verification evidence (cosmos_integration.md Step 7) — a
   // step goes "green" because the model looked at the result, not just because the
   // planner returned. visual_enforced=false means the check couldn't meaningfully run
   // (Cosmos down/timeout, or a skipped/no-motion step) — shown as NOT CHECKED, not hidden,
@@ -1085,7 +1161,7 @@ HTML = """<!DOCTYPE html>
     </div>`;
   }
 
-  // Cosmos-Reason2 PRE-dispatch reasoning (target visible / obstacle / feasibility /
+  // Cosmos PRE-dispatch reasoning (target visible / obstacle / feasibility /
   // approach) — the "is this action feasible, what path looks right" judgment made BEFORE
   // the arm moves, distinct from renderVisualEvidence's AFTER-the-fact check. Purely
   // informational (never gates dispatch) — see _attach_cosmos_assessment in the orchestrator.
@@ -1105,7 +1181,7 @@ HTML = """<!DOCTYPE html>
     const tv = a.target_visible === true ? '✓' : (a.target_visible === false ? '✗' : '?');
     const dv = a.destination_visible === true ? '✓' : (a.destination_visible === false ? '✗' : (a.destination_visible === null ? '—' : '?'));
     let html = `<div class="plan-step-detail" style="margin-top:4px;">
-      <span style="font-weight:700; letter-spacing:0.4px; color:#60a5fa;">👁 COSMOS REASON 2</span>
+      <span style="font-weight:700; letter-spacing:0.4px; color:#60a5fa;">👁 COSMOS 3 NANO REASONER</span>
       &nbsp;target ${tv} &nbsp;dest ${dv}
       &nbsp;feasibility <span style="color:${feasColor}; font-weight:700;">${(a.feasibility || '?').toUpperCase()}</span>`;
     if (a.approach) html += `&nbsp;· approach: ${a.approach}`;
@@ -1156,6 +1232,11 @@ HTML = """<!DOCTYPE html>
         <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#60a5fa;">full reasoning →</a>
       </div>`;
     }
+    const escHtml = (t) => t.replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+    if (plan.answer && !plan.active) {
+      const bad = ['REJECTED', 'FAILED', 'PARTIAL'].includes(overall);
+      html += `<div class="plan-step-detail" style="margin:8px 0 10px; padding:9px 11px; font-weight:600; line-height:1.45; color:${bad ? '#fecaca' : '#bbf7d0'}; border-left:3px solid ${bad ? '#ef4444' : '#22c55e'}; background:${bad ? 'rgba(239,68,68,0.14)' : 'rgba(34,197,94,0.10)'};">${escHtml(String(plan.answer))}</div>`;
+    }
     html += '<div class="plan-steps">';
     for (const step of (plan.steps || [])) {
       const status = step.status || 'PENDING';
@@ -1163,7 +1244,9 @@ HTML = """<!DOCTYPE html>
         <div class="plan-step-idx">${step.index}</div>
         <div class="plan-step-body">
           <div class="plan-step-text">${step.text || ''}</div>
-          ${step.detail ? `<div class="plan-step-detail">${step.detail}</div>` : ''}
+          ${step.refused
+            ? `<div class="plan-step-detail" style="color:#fecaca; margin-top:6px; padding:8px 10px; border-left:3px solid #ef4444; background:rgba(239,68,68,0.14); font-weight:600; line-height:1.45;">&#9940; Failed: ${escHtml(String(step.detail || '').replace(/^refused by the robot: /, ''))}</div>`
+            : (step.detail ? `<div class="plan-step-detail">${step.detail}</div>` : '')}
           ${renderPlannerReasoning(step)}
           ${renderCosmosAssessment(step)}
           ${renderVisualEvidence(step)}
@@ -1175,12 +1258,12 @@ HTML = """<!DOCTYPE html>
     box.innerHTML = html;
   }
 
-  // Renders the real Cosmos-Reason2 shadow-mode snapshot (/state.perception, mirrors Isaac
+  // Renders the real Cosmos shadow-mode snapshot (/state.perception, mirrors Isaac
   // Sim's own /perception) — stage pose vs Cosmos's deprojected estimate per object, one
   // grounding call per dispatched pick/place instruction. "used" is always "stage" unless
   // PERCEPTION_MODE=vision is set server-side AND that object's estimate passed the sanity
   // gate; this panel just displays whatever the backend actually did, never assumes.
-  const PERC_LABELS = { red_cube: 'Red Cube', blue_cube: 'Blue Cube', green_cube: 'Green Cube', target_tray: 'Target Tray' };
+  const PERC_LABELS = { red_cube: 'Red Cube', blue_cube: 'Blue Cube', green_cube: 'Green Cube', target_tray: 'Tray' };
   let lastPerceptionJson = null;
   function renderPerception(perc) {
     const box = document.getElementById('perceptionBox');
@@ -1191,6 +1274,7 @@ HTML = """<!DOCTYPE html>
     lastPerceptionJson = json;
 
     const mode = perc ? perc.mode : null;
+    if (mode && !perceptionSwitchUserTouched) setPerceptionSwitchUI(mode === 'pure');
     if (mode) {
       pill.className = 'status-pill mode-' + mode;
       pillText.textContent = 'PERCEPTION: ' + mode.toUpperCase();
@@ -1224,7 +1308,8 @@ HTML = """<!DOCTYPE html>
     }
     html += '</div>';
     if (perc.latency_ms != null) {
-      html += `<div class="plan-step-detail" style="margin-top:8px;">Cosmos grounding latency: ${perc.latency_ms.toFixed(0)} ms</div>`;
+      const det = perc.detector === 'color' ? 'Color-segmentation' : 'Cosmos grounding';
+      html += `<div class="plan-step-detail" style="margin-top:8px;">${det} latency: ${perc.latency_ms.toFixed(0)} ms</div>`;
     }
     box.innerHTML = html;
   }
@@ -1253,7 +1338,7 @@ HTML = """<!DOCTYPE html>
         // toggle is OFF (it's just not being dispatched to), and OFFLINE services show
         // clearly rather than the panel silently omitting them.
         if (data.service_status) {
-          const svcLabels = {isaac_sim: 'Isaac Sim', nemotron: 'Nemotron', cosmos: 'Cosmos', groot: 'GR00T VLA'};
+          const svcLabels = {isaac_sim: 'Isaac Sim', nemotron: 'Nemotron', cosmos: 'Cosmos'};
           for (const [key, label] of Object.entries(svcLabels)) {
             const el = document.getElementById('svc-' + key);
             if (!el) continue;
@@ -1269,19 +1354,6 @@ HTML = """<!DOCTYPE html>
         stageEl.innerHTML = '<span class="stage-dot"></span>STAGE: ' + stage;
         stageEl.className = 'stage-overlay' + (data.busy ? '' : ' idle');
         document.getElementById('stateLabel').textContent = data.stage || 'READY';
-
-        // Real GR00T VLA per-chunk summary (only present once a "vla:" task has run at
-        // least one chunk) — rendered into the same plan box area used for the agent plan,
-        // since VLA tasks bypass the Nemotron orchestrator entirely (opt-in "vla:" prefix).
-        const vlaBox = document.getElementById('vlaReasoningBox');
-        if (vlaBox) {
-          if (data.vla_reasoning) {
-            vlaBox.style.display = '';
-            vlaBox.innerHTML = `<span style="font-weight:700; color:#a78bfa;">🤖 GR00T VLA</span> — ${data.vla_reasoning}`;
-          } else {
-            vlaBox.style.display = 'none';
-          }
-        }
 
         const fps = (data.fps || 0).toFixed(1);
         document.getElementById('fpsBadge').textContent = fps + ' FPS';
@@ -1345,15 +1417,12 @@ HTML = """<!DOCTYPE html>
   // MJPEG stream — single persistent connection, ~30 FPS, zero polling overhead
   function connectMJPEGStream() {
       let endpoint = '/camera/stream';
-      if (currentFeed === 'front') endpoint = '/camera/front.stream';
-      else if (currentFeed === 'side') endpoint = '/camera/side.stream';
-      else if (currentFeed === 'top') endpoint = '/camera/top.stream';
-      else if (currentFeed === 'wrist') endpoint = '/camera/wrist.stream';
+      if (currentFeed === 'wrist') endpoint = '/camera/wrist.stream';
 
       liveFeed.src = bp + endpoint;
       liveFeed.onload = () => {
           const names = {
-            scene: 'Overview', front: 'Front View', side: 'Side Profile', top: 'Top-Down', wrist: 'Wrist'
+            scene: 'Overview', wrist: 'Wrist'
           };
           feedStatus.innerHTML = '<span style="color:#4ADE80;">●</span> Live (' + (names[currentFeed] || currentFeed) + ')';
           const overlay = document.getElementById('streamLoadingOverlay');
@@ -1412,6 +1481,31 @@ HTML = """<!DOCTYPE html>
   // /state polls (which may still report the pre-toggle value while the request is in
   // flight) don't visually snap it back before the server confirms the real new state.
   let agentSwitchUserTouched = false;
+  let perceptionSwitchUserTouched = false;
+  function setPerceptionSwitchUI(vision) {
+    document.getElementById('perceptionSwitch').checked = vision;
+    document.getElementById('perceptionSwitchLabel').textContent =
+      vision ? 'Pure perception — camera only' : 'Deterministic — sim positions';
+    document.getElementById('perceptionSwitchRow').classList.toggle('on', vision);
+  }
+  async function togglePerception() {
+    const vision = document.getElementById('perceptionSwitch').checked;
+    perceptionSwitchUserTouched = true;
+    setPerceptionSwitchUI(vision);
+    try {
+      const res = await fetch(bp + '/perception_mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vision })
+      });
+      if (!res.ok) setPerceptionSwitchUI(!vision);   // switch failed — show the real state
+    } catch(e) {
+      setPerceptionSwitchUI(!vision);
+    } finally {
+      perceptionSwitchUserTouched = false;
+    }
+  }
+
   async function toggleAgent() {
     const sw = document.getElementById('agentSwitch');
     const enabled = sw.checked;

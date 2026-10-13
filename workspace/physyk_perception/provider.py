@@ -15,15 +15,24 @@ import time
 
 import numpy as np
 
-from . import cosmos_client, deproject
+import os
 
-VALID_MODES = ("stage", "shadow", "vision")
+from . import color_segment, cosmos_client, deproject
+
+VALID_MODES = ("stage", "shadow", "vision", "pure")
+
+
+class PerceptionUnavailable(Exception):
+    """Raised in 'pure' mode when the camera cannot localize an object. There is deliberately
+    no fallback to simulator coordinates in that mode — the caller must treat the object as
+    not visible (reject/retry the task), exactly as a real camera-only robot would."""
 
 
 class PerceptionProvider:
     def __init__(self, get_rgb, get_depth, intrinsics, world_transform, stage_lookup,
                  label_map, mode="shadow", workspace_aabb=None, sanity_gate_m=0.08,
-                 patch=11, crop_aabb=None):
+                 patch=11, crop_aabb=None, detector=None, cube_half_height=0.025,
+                 fixed_poses=None):
         """
         get_rgb / get_depth: zero-arg callables returning the latest RGB (H,W,3 uint8) and
             depth (H,W float32, distance_to_image_plane) frames from the overview camera.
@@ -50,6 +59,21 @@ class PerceptionProvider:
             this. Falls back to no cropping (whole frame) if omitted or if projecting its
             corners fails for any reason.
         """
+        # "color" (default): HSV color masks + depth, no model, ~ms (see color_segment.py).
+        # "cosmos": the original VLM grounding path. Only used in shadow/vision modes.
+        self.detector = detector or os.environ.get("PERCEPTION_DETECTOR", "color")
+        if self.detector not in ("color", "cosmos"):
+            raise ValueError(f"invalid perception detector {self.detector!r}")
+        self.cube_half_height = cube_half_height
+        # Objects that never move (table, tray): in 'pure' mode their pose is this calibration
+        # constant — not read from the simulator and not detected.
+        self.fixed_poses = {k: np.asarray(v, dtype=float) for k, v in (fixed_poses or {}).items()}
+        self._roi = None
+        # Table-plane self-calibration (see color_segment.fit_table_plane). Refit every few seconds:
+        # the camera never moves, so this is cheap insurance, not a per-frame cost.
+        self.z_calibration = os.environ.get("PERCEPTION_ZCAL", "1") != "0"
+        self._cal = None
+        self._cal_time = 0.0
         if mode not in VALID_MODES:
             raise ValueError(f"invalid perception mode {mode!r}, must be one of {VALID_MODES}")
         self.mode = mode
@@ -121,7 +145,6 @@ class PerceptionProvider:
             }
             return
 
-        labels = [self.label_map[k] for k in obj_keys if k in self.label_map]
         try:
             rgb = self.get_rgb()
             depth = self.get_depth()
@@ -137,6 +160,12 @@ class PerceptionProvider:
                 "latency_ms": None, "error": "no camera frame available yet", "objects": {},
             }
             return
+
+        if self.detector == "color":
+            self._refresh_color(rgb, depth, obj_keys)
+            return
+
+        labels = [self.label_map[k] for k in obj_keys if k in self.label_map]
 
         # Crop to the known table region before grounding (see __init__'s crop_aabb
         # docstring for why this matters) — points come back in the CROPPED image's own
@@ -184,12 +213,81 @@ class PerceptionProvider:
             "latency_ms": latency_ms, "error": err, "objects": objects,
         }
 
+    def _table_calibration(self, rgb, depth):
+        if not self.z_calibration:
+            return None
+        if time.time() - self._cal_time > 3.0 or self._cal is None:
+            self._cal_time = time.time()
+            try:
+                fit = color_segment.fit_table_plane(rgb, depth, self.intrinsics, self.world_transform, self._roi)
+            except Exception:
+                fit = None
+            if fit is not None:
+                self._cal = fit          # keep the last good fit if a later one fails
+        return self._cal
+
+    def _refresh_color(self, rgb, depth, obj_keys):
+        """Color-mask localization. Always localizes ALL cubes (cheap), because the sim's
+        placement logic also reads the non-target cubes' poses as obstacles. Keys with no color
+        spec (the tray) get a stage-only entry, so get_object_pose() falls back to stage for them."""
+        t0 = time.time()
+        rgb = np.asarray(rgb)
+        depth = np.asarray(depth)
+        if depth.ndim == 3:
+            depth = depth[:, :, 0]
+        if self._roi is None or self._roi.shape != rgb.shape[:2]:
+            self._roi = color_segment.roi_mask(rgb.shape, self.intrinsics, self.world_transform)
+        cal = self._table_calibration(rgb, depth)
+        objects = {}
+        all_keys = set(obj_keys) | set(color_segment.COLOR_SPECS)
+        for key in sorted(all_keys - set(self.fixed_poses)):
+            stage_pos = self.stage_lookup(key)
+            found = None
+            if key in color_segment.COLOR_SPECS:
+                found = color_segment.locate_cube(
+                    rgb, depth, key, self.intrinsics, self.world_transform,
+                    cube_half_height=self.cube_half_height, roi=self._roi)
+            vision_pos = np.array(found["position"]) if found else None
+            raw_pos = None
+            if vision_pos is not None and not self._in_workspace(vision_pos):
+                vision_pos, found = None, None
+            if vision_pos is not None:
+                raw_pos = vision_pos.copy()
+                if cal is not None:
+                    # Subtract the camera's measured vertical error at this spot on the table.
+                    vision_pos[2] -= cal["a"] + cal["b"] * vision_pos[0] + cal["c"] * vision_pos[1]
+            objects[key] = {
+                "stage_pos_m": [float(v) for v in stage_pos],
+                "vision_pos_m": [float(v) for v in vision_pos] if vision_pos is not None else None,
+                "vision_pos_raw_m": [float(v) for v in raw_pos] if raw_pos is not None else None,
+                "delta_mm": float(np.linalg.norm(vision_pos - stage_pos) * 1000.0) if vision_pos is not None else None,
+                "yaw_deg": found["yaw_deg"] if found else None,
+                "bbox_px": found["bbox_px"] if found else None,
+                "mask_px": found["mask_px"] if found else None,
+                "used": "stage",
+            }
+        self._last_snapshot = {
+            "mode": self.mode, "detector": "color+depth", "updated": True, "timestamp": time.time(),
+            "latency_ms": (time.time() - t0) * 1000.0, "error": None, "objects": objects,
+            "table_calibration": cal,
+        }
+
     def get_object_pose(self, obj_key: str) -> np.ndarray:
         """The pose that should actually drive the robot for obj_key. In stage/shadow mode
         this is ALWAYS the stage (ground-truth) pose — matching the doc's own description
         of shadow mode verbatim. In vision mode, uses the last-refreshed Cosmos estimate IF
         it passed the workspace check and is within sanity_gate_m of stage; otherwise falls
         back to stage automatically."""
+        if self.mode == "pure" and obj_key in self.fixed_poses:
+            return self.fixed_poses[obj_key].copy()
+        if self.mode == "pure":
+            # Camera only. stage_lookup is NOT consulted here (it appears in the snapshot purely
+            # as a hidden scoring channel); no sanity gate against it, no fallback to it.
+            entry = self._last_snapshot.get("objects", {}).get(obj_key)
+            if not entry or entry.get("vision_pos_m") is None:
+                raise PerceptionUnavailable(f"{obj_key} not visible to the overview camera")
+            entry["used"] = "camera"
+            return np.array(entry["vision_pos_m"])
         stage_pos = self.stage_lookup(obj_key)
         if self.mode != "vision":
             return stage_pos

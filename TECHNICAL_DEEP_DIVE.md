@@ -6,11 +6,12 @@ title: Physyk Technical Deep Dive
 
 Reference doc for demo/Q&A prep. Goes one level deeper than `ARCHITECTURE.md` on how each
 piece actually works: the pick-and-place execution primitive, inverse kinematics and collision
-avoidance, GR00T-N1.7 VLA, Nemotron orchestration, and Cosmos-Reason2 perception. Every claim
-below traces to a specific file/line in the codebase — nothing here is aspirational.
+avoidance, GR00T-N1.7 VLA (**now parked**), Nemotron orchestration, Cosmos perception, and the
+camera-only pure-perception pipeline. Every claim below traces to the codebase — nothing here is
+aspirational. (Line numbers drift as the code changes; the file and function names are the stable pointers.)
 
-For the service topology (4 processes, ports, request lifecycle) see `ARCHITECTURE.md` §1 and
-§4 — not repeated here.
+For the service topology (local Docker sim, local Cosmos NIM, hosted Nemotron; ports; request lifecycle) see
+`ARCHITECTURE.md` §1 and §4 — not repeated here. For the camera-only pipeline in depth see `PERCEPTION.md`.
 
 ---
 
@@ -96,6 +97,9 @@ was one of the first real physics bugs found and fixed in the project's history.
 
 ## 2. GR00T-N1.7 — Vision-Language-Action model
 
+> **Status: parked.** Not started by `run.sh`, no GUI control, `vla:` prompts are rejected by the backend.
+> Everything below documents the integration as built; the code and fine-tuning tooling stay in the repo.
+
 ### 2.1 Architecture (from the loaded checkpoint's own `config.json`)
 
 | Component | Value |
@@ -141,8 +145,8 @@ payload = {
 
 This isn't a plumbing gap — the checkpoint's own `LIBERO_PANDA` modality config has no depth
 channel defined at all. GR00T-N1.7-LIBERO is, by design, a pure RGB+proprioception+language
-model here. (Cosmos-Reason2 does compute real depth elsewhere in this project — see §4 — but it
-isn't fed into GR00T.)
+model here. (The project does have a real depth channel — the overview camera's depth image, used by the
+camera-only perception pipeline in §4 and `PERCEPTION.md` — but it isn't fed into GR00T.)
 
 ### 2.3 From prediction to motion — the exact chain
 
@@ -206,9 +210,13 @@ this evidence, is more positional/visual diversity in the data — not just more
 *(Full architecture and diagrams: `ARCHITECTURE.md` §3-4. This section goes one level deeper
 on the actual prompts/schemas.)*
 
-**Serving**: Nemotron-30B-FP8 via vLLM, OpenAI-compatible API on port 8000
-(`--max-model-len 12288`, `--gpu-memory-utilization 0.48-0.55` depending on what else is
-sharing the GPU).
+**Serving**: NVIDIA's hosted API (`https://integrate.api.nvidia.com/v1`), model
+`nvidia/nemotron-3-super-120b-a12b`, configured in `physyk_config.py` / `.env`. (The earlier setup served
+Nemotron-30B-FP8 locally through vLLM on port 8000; that is retired. A local OpenAI-compatible server still works by
+setting `NEMOTRON_BASE_URL`.) The hosted model returns its chain-of-thought in a separate `reasoning_content`
+field rather than inline before `</think>`; `_message_text()` in the orchestrator folds it back into the
+`reasoning</think>answer` shape the parsers and the reasoning log expect. Calls retry on 429/5xx; typical
+latency is ~1 s for a one-step plan and ~6-7 s for a multi-step plan.
 
 ### 3.1 Decomposition — exact schema
 
@@ -243,6 +251,12 @@ speed and determinism:
 - `_reference_out_of_tray` / `_subgoal_drift_detected` — did a stacking reference object
   physically move or leave the tray since an earlier step verified it, before dispatching the
   next step that depends on it.
+
+**Guardrail retry (camera-derived scenes only).** In pure-perception mode the scene's positions are
+measured, so a value can sit right on a limit and fail once (a resting cube read Z = 0.0196 against a 0.02
+floor) and pass on the next look. `run()` re-observes and re-validates up to `GUARDRAIL_RETRIES` = 3 times,
+`GUARDRAIL_RETRY_DELAY_S` = 0.8 s apart, before rejecting; it is skipped when the scene is the deterministic one.
+(The height bias that caused this in the first place was fixed in the detector — see `PERCEPTION.md`.)
 
 ### 3.3 Failure handling — the 3-way decision
 
@@ -284,39 +298,39 @@ sequenceDiagram
 
 ---
 
-## 4. Cosmos-Reason2 — perception, real vs. designed
+## 4. Cosmos and perception
 
-This is worth stating clearly because it's easy to assume a perception-integration doc is
-aspirational: **it is not — the shadow-mode integration described in `cosmos_integration.md`
-is actually implemented and running**, not just planned.
+**Cosmos 3 Nano Reasoner (8B)** runs locally as a NIM container (`nvcr.io/nim/nvidia/cosmos3-reasoner`) on port
+8001 — it is not available on the hosted API. It shares the 24 GB laptop GPU with Isaac Sim, so
+`start_cosmos_docker.sh` runs it lean: the FP8 build (~10 GB weights, ~16 GB total VRAM), an 8192-token
+context, a 65% GPU share, and CUDA graphs off (the defaults — bf16, 262k context, CUDA graphs — crash on this GPU).
+Cosmos is **evidence only**: it never decides what the robot does. (The original build used Cosmos-Reason2-2B
+through vLLM; the client code is model-agnostic and parses `<think>/<answer>` and `reasoning_content` outputs.)
 
-**Serving**: Cosmos-Reason2-2B via vLLM, port 8001, `--reasoning-parser qwen3` (Cosmos-Reason2
-is built on the Qwen3-VL architecture — the same backbone family GR00T-N1.7 itself uses for its
-vision-language encoder, a deliberate ecosystem-consistency choice worth naming in Q&A).
+### 4.1 Perception modes
 
-### 4.1 Three-mode perception seam
+- **`stage` / `shadow`** (default; GUI switch off) — the simulator's ground-truth poses drive the robot.
+  `shadow` additionally runs the camera detector and logs the delta.
+- **`vision`** — legacy hybrid: the camera pose drives IK, gated by an 8 cm sanity check against the stage pose with
+  fallback to it. Not used by the GUI.
+- **`pure`** (GUI switch on: "Pure perception — camera only") — camera only, no simulator coordinates, no fallback;
+  the tray is a fixed constant; verification is a fresh camera look. The detector is **color segmentation + depth**
+  (`color_segment.py`), not Cosmos: ~20 ms, no GPU, ~3 mm mean error. Cosmos's own grounding (a VLM returning
+  pixel points) measured within 2-3 px on a test frame but takes 1.5-3 s per call and returns a point rather than a
+  mask, so it stays a semantic layer. Full write-up, measurements and the debugging story: `PERCEPTION.md`.
 
-- **`stage`** — ground-truth USD object poses drive the robot (the original, always-correct
-  baseline).
-- **`shadow`** (current default, `PERCEPTION_MODE` env var) — stage pose still drives the
-  robot; Cosmos runs in parallel on the same scene and its estimate is only **logged as a
-  delta**, zero risk to reliability. This is the safety-first default.
-- **`vision`** — Cosmos's own deprojected pose estimate would actually drive IK, gated by an
-  8cm sanity threshold with automatic fallback to stage pose on failure or an out-of-gate
-  delta. Implemented, not currently the default.
+### 4.2 Real Cosmos call sites
 
-### 4.2 Real call sites
+- **Pre-dispatch visual assessment** (`_attach_cosmos_assessment`, `physyk_agent_orchestrator.py`) — before a subgoal
+  is dispatched, Cosmos assesses feasibility (target/destination visible, obstacle, approach) from the clean overview
+  frame. Informational only.
+- **Post-dispatch visual verification** (`_attach_visual_evidence`) — after the motion, Cosmos is asked whether the
+  outcome is visually true ("is the blue cube on top of the red cube?") as an independent check next to the real
+  position-based verification. Observed: `verified=True`, confidence 0.99 on the stacking run.
 
-- **Pre-dispatch visual assessment** (`_attach_cosmos_assessment`,
-  `physyk_agent_orchestrator.py:794`) — before a subgoal is dispatched, Cosmos is asked to
-  visually assess feasibility (object visible/accessible, path clear) and the result is logged.
-- **Post-dispatch visual verification** (~line 762) — after motion completes, Cosmos is asked
-  to visually confirm the outcome (e.g. "is the cube actually on top of the other cube") as an
-  independent check alongside the real telemetry-based verification.
-
-Both are logged to the reasoning dashboard (`/reasoning/cosmos`), viewable live alongside
-Nemotron's own reasoning log (`/reasoning/nemotron`) and a real-time 4-service status panel
-(Isaac Sim / Nemotron / Cosmos / GR00T VLA — all added this session).
+Both write to the Cosmos log (`/reasoning/cosmos`) **with the exact image Cosmos was shown**. Cosmos receives the clean
+frame (`/camera/scene_raw.jpg`), never the perception overlay, so drawn labels can't bias it. A Cosmos failure or
+timeout yields "NOT CHECKED" and never blocks a plan.
 
 ---
 
@@ -324,11 +338,12 @@ Nemotron's own reasoning log (`/reasoning/nemotron`) and a real-time 4-service s
 
 | What | Where |
 |---|---|
-| Main GUI + live cameras | `http://<host>:7860` |
-| 4-service status panel | Header of the main GUI (green/gray pills) |
-| Nemotron full reasoning log | `http://<host>:7860/reasoning/nemotron` |
-| Cosmos full reasoning log | `http://<host>:7860/reasoning/cosmos` |
-| GR00T VLA policy server | `http://<host>:8300/health` |
-| Full stack startup | `./run.sh` (starts all 5: Isaac Sim, GUI, Nemotron, Cosmos, GR00T) |
-| Scripted-path-only (no orchestrator/perception) | `./run.sh --no-agent` |
+| Main GUI + live cameras | `http://localhost:7860` |
+| Service status panel | Header of the main GUI (Isaac Sim / Nemotron / Cosmos pills) |
+| Nemotron full reasoning log | `http://localhost:7860/reasoning/nemotron` |
+| Cosmos log (with the images Cosmos saw) | `http://localhost:7860/reasoning/cosmos` |
+| Perception log (annotated frames, bounding boxes, XYZ) | `http://localhost:7860/reasoning/perception` |
+| Perception snapshot / mode | `http://localhost:8100/perception` (mode, per-object camera XYZ, scoring delta) |
+| Start the sim / everything else | `./start_sim_docker.sh`, then `./run.sh` (Cosmos: `./start_cosmos_docker.sh`) |
+| Scripted-path-only (no Nemotron) | `./run.sh --no-agent` |
 | Live status check any time | `./run.sh --status` |

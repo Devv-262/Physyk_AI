@@ -1,4 +1,4 @@
-"""Grounding calls to the served Cosmos-Reason2-2B model (port 8001, OpenAI-compatible
+"""Grounding calls to the served Cosmos 3 Nano Reasoner model (port 8001, OpenAI-compatible
 /v1/chat/completions). Reuses exactly the parsing behavior confirmed empirically earlier in
 this project (cosmos_smoke_test.py, perception_calib/): the real answer often lands in the
 `reasoning` field (not `content`) because the server runs with --reasoning-parser qwen3, and
@@ -18,8 +18,51 @@ import urllib.error
 import numpy as np
 from PIL import Image
 
-COSMOS_URL = "http://localhost:8001/v1/chat/completions"
-DEFAULT_TIMEOUT_S = 6.0  # per cosmos_integration.md's own guard rail for shadow/vision mode
+import physyk_config as cfg
+
+COSMOS_URL = f"{cfg.COSMOS_BASE_URL}/chat/completions"
+# Was 6s against a local server; the hosted API adds network latency plus the 8B's own
+# reasoning time. Cosmos is never in the decision path, so a longer wait only delays evidence.
+DEFAULT_TIMEOUT_S = 30.0
+_MAX_TOKENS = 1024
+_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def _extract_answer(msg: dict) -> str:
+    """The answer can land in `content`, or (reasoning parsers) in `reasoning`/`reasoning_content`."""
+    text = msg.get("content") or msg.get("reasoning_content") or msg.get("reasoning") or ""
+    # Cosmos 3 can answer as "<think>...</think><answer>...</answer>". The reasoning may itself
+    # contain braces, so keep only the answer before anything tries to find the JSON object.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1]
+    answer = re.search(r"<answer>(.*?)(?:</answer>|$)", text, re.DOTALL)
+    return answer.group(1).strip() if answer else text.strip()
+
+
+def _post_with_retry(payload: dict, timeout: float):
+    """POST payload to the configured Cosmos endpoint. Returns (body_dict, latency_ms, error).
+    One retry on 429/5xx (free-tier rate limit), never raises."""
+    data = json.dumps(payload).encode("utf-8")
+    headers = cfg.auth_headers(cfg.COSMOS_API_KEY)
+    t0 = time.time()
+    last_err = "no attempt made"
+    for attempt in range(2):
+        req = urllib.request.Request(COSMOS_URL, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8")), (time.time() - t0) * 1000.0, None
+        except urllib.error.HTTPError as e:
+            last_err = f"HTTP {e.code}"
+            if e.code not in _RETRY_STATUS:
+                break
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = f"request failed: {e}"
+            break
+        except Exception as e:
+            last_err = f"unexpected error: {e}"
+            break
+        time.sleep(2.0)
+    return None, (time.time() - t0) * 1000.0, last_err
 
 
 def _encode_rgb_png(rgb: np.ndarray) -> str:
@@ -35,7 +78,7 @@ def _post_chat(image_b64: str, mime: str, prompt: str, timeout: float):
     connection refused, malformed response) comes back as a non-None error string instead,
     so callers can degrade gracefully rather than needing their own try/except around this."""
     payload = {
-        "model": "nvidia/Cosmos-Reason2-2B",
+        "model": cfg.COSMOS_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -44,27 +87,14 @@ def _post_chat(image_b64: str, mime: str, prompt: str, timeout: float):
             ],
         }],
         "temperature": 0.0,
-        "max_tokens": 512,
+        "max_tokens": _MAX_TOKENS,
     }
-    req = urllib.request.Request(
-        COSMOS_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return None, (time.time() - t0) * 1000.0, f"request failed: {e}"
-    except Exception as e:
-        return None, (time.time() - t0) * 1000.0, f"unexpected error: {e}"
-    latency_ms = (time.time() - t0) * 1000.0
+    body, latency_ms, err = _post_with_retry(payload, timeout)
+    if err is not None:
+        return None, latency_ms, err
 
     try:
-        msg = body["choices"][0]["message"]
-        raw_answer = msg.get("content") or msg.get("reasoning") or ""
+        raw_answer = _extract_answer(body["choices"][0]["message"])
     except (KeyError, IndexError, TypeError) as e:
         return None, latency_ms, f"malformed response: {e}"
     return raw_answer, latency_ms, None
@@ -115,7 +145,7 @@ def ground_objects(rgb: np.ndarray, labels: list, timeout: float = DEFAULT_TIMEO
         f"visible. Example: " + json.dumps({labels[0]: [500, 500]}) if labels else "{}"
     )
     payload = {
-        "model": "nvidia/Cosmos-Reason2-2B",
+        "model": cfg.COSMOS_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -124,27 +154,14 @@ def ground_objects(rgb: np.ndarray, labels: list, timeout: float = DEFAULT_TIMEO
             ],
         }],
         "temperature": 0.0,
-        "max_tokens": 512,
+        "max_tokens": _MAX_TOKENS,
     }
-    req = urllib.request.Request(
-        COSMOS_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        return {label: None for label in labels}, (time.time() - t0) * 1000.0, f"request failed: {e}"
-    except Exception as e:
-        return {label: None for label in labels}, (time.time() - t0) * 1000.0, f"unexpected error: {e}"
-    latency_ms = (time.time() - t0) * 1000.0
+    body, latency_ms, err = _post_with_retry(payload, timeout)
+    if err is not None:
+        return {label: None for label in labels}, latency_ms, err
 
     try:
-        msg = body["choices"][0]["message"]
-        raw_answer = msg.get("content") or msg.get("reasoning") or ""
+        raw_answer = _extract_answer(body["choices"][0]["message"])
     except (KeyError, IndexError, TypeError) as e:
         return {label: None for label in labels}, latency_ms, f"malformed response: {e}"
 
