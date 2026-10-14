@@ -12,6 +12,8 @@ localhost. Fixed by mounting these as ordinary routes on the SAME FastAPI app al
 port 7860 instead — /reasoning/<agent> — so they ride along with whatever forwarding already
 gets the main dashboard through. No new ports, nothing extra to expose.
 """
+import base64
+import html
 import time
 import threading
 from collections import deque
@@ -30,7 +32,9 @@ class ReasoningLog:
         self._entries = deque(maxlen=MAX_ENTRIES)
         self._lock = threading.Lock()
 
-    def add(self, label: str, text: Optional[str]):
+    def add(self, label: str, text: Optional[str], image: Optional[bytes] = None):
+        """`image` (JPEG bytes), if given, is shown with the entry — e.g. the exact camera frame
+        a vision model was asked about."""
         if not text:
             return
         with self._lock:
@@ -38,6 +42,7 @@ class ReasoningLog:
                 "t": time.strftime("%H:%M:%S"),
                 "label": label,
                 "text": text,
+                "image_b64": base64.b64encode(image).decode("ascii") if image else None,
             })
 
     def snapshot(self):
@@ -47,8 +52,9 @@ class ReasoningLog:
     def render_html(self) -> str:
         rows = "".join(
             f"""<div class="entry">
-                  <div class="meta"><span class="t">{e['t']}</span> <span class="label">{e['label']}</span></div>
-                  <div class="text">{e['text']}</div>
+                  <div class="meta"><span class="t">{e['t']}</span> <span class="label">{html.escape(e['label'])}</span></div>
+                  <div class="text">{html.escape(e['text'])}</div>
+                  {'<img class="frame" src="data:image/jpeg;base64,' + e['image_b64'] + '">' if e.get('image_b64') else ''}
                 </div>"""
             for e in self.snapshot()
         )
@@ -58,16 +64,20 @@ class ReasoningLog:
 <html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
 <title>{self.name} — Reasoning</title>
 <style>
-  body {{ background:#0a0c10; color:#e5e7eb; font-family:'JetBrains Mono',ui-monospace,monospace;
-         margin:0; padding:24px; }}
-  h1 {{ color:{self.accent}; font-size:1.1rem; margin:0 0 16px; letter-spacing:0.5px; }}
-  .entry {{ border-left:3px solid {self.accent}; background:rgba(255,255,255,0.03);
-            padding:10px 14px; margin-bottom:10px; border-radius:0 6px 6px 0; }}
-  .meta {{ font-size:0.7rem; color:#9ca3af; margin-bottom:4px; }}
-  .t {{ opacity:0.7; }}
-  .label {{ font-weight:700; color:{self.accent}; }}
-  .text {{ font-size:0.82rem; line-height:1.5; white-space:pre-wrap; }}
-  .empty {{ color:#6b7280; font-style:italic; }}
+  body {{ background:radial-gradient(1000px 600px at 8% -10%, rgba(110,140,205,0.12), transparent 62%), #0a0c10; color:#e5e8ef;
+         font-family:'Inter',-apple-system,'Segoe UI',Roboto,sans-serif; margin:0; padding:28px 32px; min-height:100vh; }}
+  h1 {{ color:#eef1f7; font-size:1.05rem; font-weight:600; margin:0 0 18px; letter-spacing:0.2px;
+        padding-bottom:12px; border-bottom:1px solid #232a38; }}
+  .entry {{ border-left:2px solid {self.accent}; background:rgba(22,27,36,0.7); border-top:1px solid #1c222e;
+            border-right:1px solid #1c222e; border-bottom:1px solid #1c222e;
+            padding:12px 16px; margin-bottom:10px; border-radius:0 8px 8px 0; }}
+  .meta {{ font-size:0.72rem; color:#7e879a; margin-bottom:5px; }}
+  .t {{ opacity:0.8; font-variant-numeric:tabular-nums; }}
+  .label {{ font-weight:600; color:{self.accent}; }}
+  .text {{ font-family:'JetBrains Mono',ui-monospace,monospace; font-size:0.8rem; line-height:1.55; white-space:pre-wrap; color:#d0d5e0; }}
+  .empty {{ color:#59626f; }}
+  .frame {{ display:block; margin-top:10px; max-width:100%; width:560px; border-radius:6px;
+            border:1px solid #232a38; }}
 </style></head>
 <body>
   <h1>{self.name} — Full Reasoning Log</h1>
@@ -78,8 +88,13 @@ class ReasoningLog:
 # Module-level singletons — created once regardless of import order between
 # physyk_agent_orchestrator.py (pushes entries into these) and physyk_main_server.py (mounts
 # routes for them once its FastAPI `app` exists). Both import from here.
-NEMOTRON_REASONING_LOG = ReasoningLog("Nemotron Planning", "#60a5fa")
-COSMOS_REASONING_LOG = ReasoningLog("Cosmos Reason 2", "#34d399")
+NEMOTRON_REASONING_LOG = ReasoningLog("Nemotron Planning", "#8ea3cf")
+COSMOS_REASONING_LOG = ReasoningLog("Cosmos 3 Nano Reasoner", "#8ea3cf")
+
+
+# Pages that are not backed by a ReasoningLog (name -> zero-arg callable returning HTML). The main
+# server registers "perception" here: its data lives in the Isaac Sim process, not in this one.
+custom_pages = {}
 
 
 def mount_reasoning_routes(app: FastAPI):
@@ -89,6 +104,8 @@ def mount_reasoning_routes(app: FastAPI):
 
     @app.get("/reasoning/{agent}", response_class=HTMLResponse)
     def reasoning_page(agent: str):
+        if agent in custom_pages:
+            return HTMLResponse(custom_pages[agent]())
         log = logs.get(agent)
         if log is None:
             return HTMLResponse(f"<h1>Unknown agent '{agent}'</h1>", status_code=404)

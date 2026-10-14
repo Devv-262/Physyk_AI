@@ -1,41 +1,29 @@
 #!/usr/bin/env python3
 """
-Physyk AI — Real Nemotron Agentic Orchestrator (Phase 5)
-==========================================================
-This used to be a rule-based string-matching task decomposer whose output was computed and
-then thrown away by physyk_main_server.py — the real dispatch happened via a separate direct
-call right after (see PLAN.md Part 2 / dev-progress.md). That's gone. This module now:
+Physyk AI — Nemotron agentic orchestrator
+==========================================
+Turns a free-form instruction into a verified sequence of pick-and-place calls:
 
-1. Calls the real Nemotron-30B server (nemotron_fastapi_server / vLLM OpenAI server, port
-   8000 — see start_nemotron.sh) to decompose a free-form instruction into an ordered list of
-   structured pick-and-place subgoals, grounded against the *live* scene state (real object
-   positions from isaac_sim_service.py's /state, not a hardcoded object list).
-2. Runs a real NeMo-style guardrail check (`PhysicalWorkspaceRails`) against each subgoal's
-   resolved target/destination before it is ever dispatched to the robot.
-3. Dispatches each subgoal, in order, as a plain-text instruction into the existing
-   `/execute` -> `resolve_pick_place_targets()` -> `PickPlaceController` pipeline on
-   isaac_sim_service.py (port 8100) — that pipeline is untouched; it's used as a tool/skill,
-   exactly as-is. Waits for the sim to go idle and reads back the real post-place verification
-   result (`last_task_success` / `last_task_error_mm`).
-4. On a verified failure, does NOT follow a fixed retry-then-give-up schedule. It asks
-   Nemotron to actually diagnose the failure (real error, live scene, what's already been
-   completed) and choose: retry as-is / replan just this step / replan the rest of the plan —
-   one LLM call per failure, not a separate call for the decision and the replan. A disturbance
-   to an already-completed placement (something knocked over mid-plan) is detected this way,
-   not hardcoded.
-5. After every subgoal reports DONE, runs one deterministic (code-only, no LLM) final check
-   that the original goal still holds — re-comparing each verified placement's position against
-   what it was at verification time, catching a later step disturbing an earlier one. Only
-   unconditional plan SUCCESS if that holds too.
+1. Plans the steps. "Stack the cubes" (no colours, no and/then) is planned in code from the live cube positions (easiest first);
+   anything else is decomposed by Nemotron (NVIDIA's hosted API, see physyk_config.py) into an ordered list of structured pick-and-place
+   subgoals grounded against the *live* scene from isaac_sim_service.py's /state.
+2. Runs a deterministic guardrail check (`PhysicalWorkspaceRails`) against each subgoal's target and destination before it is dispatched.
+3. Clears a blocking cube first when the target has another cube on top of it.
+4. Dispatches each subgoal as a plain-text instruction into the sim's `/execute` -> `resolve_pick_place_targets()` -> `PickPlaceController`
+   pipeline (port 8100), waits for the sim to go idle and reads back the real post-place verification (`last_task_success` /
+   `last_task_error_mm`).
+5. On a verified failure, asks Nemotron to diagnose it (real error, live scene, what is already done) and choose: retry as-is / replan this
+   step / replan the rest of the plan - one LLM call per failure. A refusal from the sim is reported verbatim and not retried.
+6. After every subgoal reports DONE, runs one deterministic final check that the original goal still holds.
 
-No local model is loaded in this module or its caller — everything here is a plain HTTP client
-of two already-running real servers, so this stays cheap to import from physyk_main_server.py
-(which runs under plain system python3, not a GPU-framework venv).
+No model is loaded in this module: everything here is a plain HTTP client of the Nemotron API, Isaac Sim and Cosmos, so it stays cheap to
+import from physyk_main_server.py.
 """
 
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -44,8 +32,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-
+import stack_planner as sp
 from physyk_perception import step_verifier
 from reasoning_dashboard import NEMOTRON_REASONING_LOG, COSMOS_REASONING_LOG
 
@@ -60,12 +47,13 @@ from reasoning_dashboard import NEMOTRON_REASONING_LOG, COSMOS_REASONING_LOG
 logging.basicConfig(level=logging.INFO, format="[NeMo-Agent] %(message)s")
 log = logging.getLogger("physyk.orchestrator")
 
-NEMOTRON_URL = "http://localhost:8000"
-ISAAC_SIM_URL = "http://localhost:8100"
+import physyk_config as cfg
+
+ISAAC_SIM_URL = cfg.ISAAC_SIM_URL
 
 HTTP_TIMEOUT_S = 2.0
-NEMOTRON_TIMEOUT_S = 20.0
-PLAN_STEP_TIMEOUT_S = 150.0  # max time to wait for one dispatched subgoal to finish — a real
+NEMOTRON_TIMEOUT_S = 90.0   # hosted API + a reasoning model's chain-of-thought: seconds, not ms
+PLAN_STEP_TIMEOUT_S = 300.0  # max time to wait for one dispatched subgoal to finish — a real
                               # pick-place has been observed taking 40-45s+ on its own, and
                               # longer under concurrent load; give real margin rather than
                               # risk a live task being cut off mid-motion (a timeout is now
@@ -74,12 +62,23 @@ PLAN_STEP_TIMEOUT_S = 150.0  # max time to wait for one dispatched subgoal to fi
                               # not a correctness knob).
 POLL_INTERVAL_S = 0.3
 MAX_SUBGOAL_ATTEMPTS = 3     # 1 plain retry, then 1 Nemotron-replanned corrective attempt
+# Who plans "stack the cubes": "code" (default) = the local planner in stack_planner.py (positions only, no model call,
+# re-planned from the live scene after every step); "llm" = Nemotron decides (slow and unreliable with a thinking model).
+# The code planner is also the fallback when Nemotron is unreachable.
+STACK_PLANNER = os.environ.get("PHYSYK_STACK_PLANNER", "code").lower()
+MAX_STACK_PLAN_CHANGES = 12      # hard cap on plan rewrites per run (a loop guard)
+MAX_STACK_REPLANS = 6              # re-plans after a step that failed (not counting the normal re-plan after each step)
+GUARDRAIL_RETRIES = 3        # re-observations before a guardrail failure on a camera-derived scene stands
+GUARDRAIL_RETRY_DELAY_S = 0.8  # a bit over the sim's 0.5 s idle perception refresh
+
+
+def _scene_is_camera_derived(scene) -> bool:
+    """True when the live scene's objects came from the camera (pure-perception mode)."""
+    return any(o.get("source") == "camera" for o in (scene.get("objects") or {}).values())
 
 
 # ─── Real NeMo Safety Guardrails ───────────────────────────────────────────────
-# Bounds match VLA_XYZ_MIN/MAX in isaac_sim_service.py — the same reachable-workspace clamp
-# already validated there for GR00T VLA safety, reused here per PLAN.md 5.2 rather than
-# re-derived, so both safety paths agree on what "reachable" means.
+# Bounds of the arm's validated reachable workspace (metres, robot base at the origin, table top at z = 0).
 
 @dataclass
 class PhysicalWorkspaceRails:
@@ -88,11 +87,14 @@ class PhysicalWorkspaceRails:
     x_max: float = 0.70
     y_min: float = -0.45
     y_max: float = 0.45
-    z_min: float = 0.02
+    z_min: float = -0.01     # a cube centre rests at 0.025 but can sink a few mm into the table; below ~0 is a real error
     z_max: float = 0.50
+    r_min: float = 0.36      # closer to the robot base than this the arm folds until joint 6 hits its limit: the grasp fails
 
     def validate_cartesian_target(self, target_xyz, check_z: bool = True) -> Tuple[bool, str]:
         x, y, z = float(target_xyz[0]), float(target_xyz[1]), float(target_xyz[2])
+        if math.hypot(x, y) < self.r_min:
+            return False, f"target is too close to the robot base (radius {math.hypot(x, y):.2f} m, minimum {self.r_min} m): the hand pointing down cannot reach it"
         if not (self.x_min <= x <= self.x_max):
             return False, f"X-target {x:.3f}m out of bounds [{self.x_min}, {self.x_max}]"
         if not (self.y_min <= y <= self.y_max):
@@ -120,7 +122,7 @@ def _get_scene_frame() -> Optional[Tuple[bytes, str]]:
     re-encode needed, for step_verifier.py's visual post-condition checks (Step 7). Returns
     None on any failure; callers must treat that as "no frame available", never raise."""
     try:
-        req = urllib.request.Request(f"{ISAAC_SIM_URL}/camera/scene.jpg", headers={"User-Agent": "Physyk-Orchestrator"})
+        req = urllib.request.Request(f"{ISAAC_SIM_URL}/camera/scene_raw.jpg", headers={"User-Agent": "Physyk-Orchestrator"})
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             return resp.read(), "image/jpeg"
     except Exception as e:
@@ -128,12 +130,13 @@ def _get_scene_frame() -> Optional[Tuple[bytes, str]]:
         return None
 
 
-def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = HTTP_TIMEOUT_S) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = HTTP_TIMEOUT_S,
+                    headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
     try:
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers=headers or {"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -337,6 +340,168 @@ def _describe_scene(scene: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+
+# ─── Stack awareness (cubes) ─────────────────────────────────────────────────────────────────────────────────
+# A cube with another cube on top of it cannot be picked: the blocker has to be moved off first. Positions come from the
+# live scene (simulator coordinates, or the camera in pure-perception mode), so this works on whatever stacks exist NOW.
+STACK_XY_M = 0.035                 # |dxy| below this = the other cube sits on this one
+STACK_MIN_DZ_M = 0.035             # ...and is at least this much higher (a full layer is 0.05)
+FREE_SPOT_DESTINATION = "on a free spot on the table"
+MAX_BLOCKER_MOVES = 4              # safety valve: blocker-clearing steps inserted per run
+
+
+def _cube_keys(scene: Dict[str, Any]) -> List[str]:
+    return [k for k in (scene.get("objects", {}) or {}) if k.endswith("_cube")]
+
+
+def _cube_pos(scene: Dict[str, Any], key: str):
+    return (scene.get("objects", {}) or {}).get(key, {}).get("position")
+
+
+def _cube_on_top_of(key: str, scene: Dict[str, Any]) -> Optional[str]:
+    """The cube resting directly on `key` (the lowest one above it, i.e. the next layer), or None."""
+    base = _cube_pos(scene, key)
+    if base is None:
+        return None
+    best, best_z = None, None
+    for other in _cube_keys(scene):
+        if other == key:
+            continue
+        p = _cube_pos(scene, other)
+        if p is None:
+            continue
+        if math.hypot(p[0] - base[0], p[1] - base[1]) < STACK_XY_M and p[2] - base[2] > STACK_MIN_DZ_M:
+            if best is None or p[2] < best_z:
+                best, best_z = other, p[2]
+    return best
+
+
+def _stack_blocker(key: str, scene: Dict[str, Any]) -> Optional[str]:
+    """The cube that must be moved before `key` can be picked: the TOP of the pile above `key`, or None if its top is free."""
+    blocker, seen = None, {key}
+    cur = _cube_on_top_of(key, scene)
+    while cur is not None and cur not in seen:
+        blocker = cur
+        seen.add(cur)
+        cur = _cube_on_top_of(cur, scene)
+    return blocker
+
+
+def _cube_name(scene: Dict[str, Any], key: str) -> str:
+    return str((scene.get("objects", {}) or {}).get(key, {}).get("name", key)).lower()
+
+
+_STACK_ALL_RE = re.compile(r"\b(?:stack|pile|tower)\b.*\b(?:all|every|the|these|three|3)?\b.*\bcubes?\b|\bcubes?\b.*\b(?:stack|pile|tower)\b")
+_NAMED_CUBE_RE = re.compile(r"\b(?:red|green|blue)\b")
+
+
+def _ease(scene: Dict[str, Any], k: str) -> float:
+    """How easy a cube is to pick: lower = easier. Nothing on top of it first (a covered cube cannot be picked), then the
+    closest to the robot, with a penalty for each neighbour within hand-room (the open hand is ~0.11 m wide)."""
+    p = _cube_pos(scene, k)
+    crowd = sum(1 for o in _cube_keys(scene) if o != k and _cube_pos(scene, o) is not None
+                and math.hypot(_cube_pos(scene, o)[0] - p[0], _cube_pos(scene, o)[1] - p[1]) < 0.11)
+    near_base = 5.0 if math.hypot(p[0], p[1]) < 0.40 else 0.0     # a pile near the base needs the wrist at its limit
+    return (1.0 if _cube_on_top_of(k, scene) else 0.0) * 10.0 + math.hypot(p[0], p[1]) + 0.08 * crowd + near_base
+
+
+TRAY_XY = (0.42, -0.32)
+IN_TRAY_RADIUS_M = 0.13
+
+
+def _in_tray(scene: Dict[str, Any], k: str) -> bool:
+    p = _cube_pos(scene, k)
+    return p is not None and math.hypot(p[0] - TRAY_XY[0], p[1] - TRAY_XY[1]) < IN_TRAY_RADIUS_M
+
+
+def _stack_plan(scene: Dict[str, Any], surface: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Subgoals that stack every cube into ONE pile, chosen from the cubes' current positions - never by colour:
+      - an existing stack is kept: its bottom cube is the base and what stands on it stays;
+      - otherwise the EASIEST cube (nothing on it, closest to the robot, most room) is the base: it is first on the stack and
+        does not have to move;
+      - the other cubes are stacked on top in order of ease, easiest first."""
+    keys = [k for k in _cube_keys(scene) if _cube_pos(scene, k) is not None]
+    if len(keys) < 2:
+        return []
+
+    def above_count(k):
+        n, cur, seen = 0, _cube_on_top_of(k, scene), {k}
+        while cur is not None and cur not in seen:
+            n, seen = n + 1, seen | {cur}
+            cur = _cube_on_top_of(cur, scene)
+        return n
+
+    tray = surface == "tray"
+    in_tray = [k for k in keys if _in_tray(scene, k)] if tray else []
+    base_to_free_spot = False
+    # With the tray: the pile stands IN the tray. A pile already there is kept; otherwise the easiest cube is set in the tray first.
+    if tray and not in_tray:
+        # No pile in the tray yet: build a NEW one there, easiest (uncovered, closest) cube first - an existing tower elsewhere
+        # is taken apart from the top, never carried from the bottom.
+        base = min(keys, key=lambda k: _ease(scene, k))
+        pile = [base]
+    elif surface == "table" and all(_in_tray(scene, k) for k in keys):
+        # Asked for the table but every cube is in the tray: build a new pile on a free table spot, easiest cube first.
+        base = min(keys, key=lambda k: _ease(scene, k))
+        pile = [base]
+        base_to_free_spot = True
+    else:
+        # On the table the pile must not use a cube that is in the tray as its base (that would be a pile in the tray).
+        cands = [k for k in keys if not _in_tray(scene, k)] if surface == "table" else keys
+        base = max(in_tray or cands or keys, key=lambda k: (above_count(k), -_ease(scene, k)))
+        pile = [base]                                   # bottom -> top, as it will stand
+        cur = _cube_on_top_of(base, scene)
+        while cur is not None and cur not in pile:
+            pile.append(cur)
+            cur = _cube_on_top_of(cur, scene)
+    rest = sorted((k for k in keys if k not in pile), key=lambda k: _ease(scene, k))
+    goals, top = [], pile[-1]
+    if tray and not in_tray:
+        # the base cube itself has to be carried to the tray (it is not the one that stays put)
+        goals.append({"action": "pick_place", "target": _cube_name(scene, base), "destination": "in the tray"})
+    elif base_to_free_spot:
+        goals.append({"action": "pick_place", "target": _cube_name(scene, base), "destination": FREE_SPOT_DESTINATION})
+    for k in rest:
+        goals.append({"action": "pick_place", "target": _cube_name(scene, k),
+                      "destination": f"on top of the {_cube_name(scene, top)}"})
+        top = k
+    return [_validate_subgoal_shape(g) for g in goals]
+
+
+def _is_single_pile(scene: Dict[str, Any], keys: List[str]) -> bool:
+    for k in keys:
+        n, cur, seen = 0, _cube_on_top_of(k, scene), {k}
+        while cur is not None and cur not in seen:
+            n, seen = n + 1, seen | {cur}
+            cur = _cube_on_top_of(cur, scene)
+        if n == len(keys) - 1:
+            return True
+    return False
+
+
+_STACK_WORD_RE = re.compile(r"\b(?:stack|pile|tower)\b|\bon top of (?:each other|one another|another)\b|\bone (?:on|above) (?:the )?other\b")
+
+
+def _stack_request(instruction: str) -> Optional[Dict[str, Any]]:
+    """'stack the cubes' / 'stack them in the tray' / 'build a tower on the table' ... -> {"surface": "tray"|"table"|None}.
+    None for anything that names a colour or sequences steps ("and"/"then"): those are specific orders for Nemotron."""
+    t = re.sub(r"\s+", " ", instruction.lower().strip())
+    if not _STACK_WORD_RE.search(t) or _NAMED_CUBE_RE.search(t) or re.search(r"\b(?:then|and|after)\b", t):
+        return None
+    surface = "tray" if re.search(r"\btray\b", t) else ("table" if re.search(r"\b(?:table|tabletop|bench)\b", t) else None)
+    return {"surface": surface}
+
+
+def _expand_stack_instruction(instruction: str, scene: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, Any]], str]]:
+    """A stacking request -> the local planner's subgoals and a plain explanation (no LLM call). ([], note) when there is
+    nothing to do (already one pile / fewer than two cubes)."""
+    req = _stack_request(instruction)
+    if req is None:
+        return None
+    plan = sp.plan_stack(scene, req["surface"])
+    return plan.goals(), plan.note
+
+
 # ─── Real Nemotron-30B Task Decomposition ──────────────────────────────────────
 
 NEMOTRON_SYSTEM_PROMPT = """You are the cognitive planner for a real Franka Panda robot arm \
@@ -373,6 +538,29 @@ Instruction: "put the red cube in the tray, then stack the blue cube on top of i
   {"action": "pick_place", "target": "blue cube", "destination": "red cube"}
 ]
 
+"Stack" / "pile" / "tower" always means a VERTICAL pile: each cube is placed "on top of" the one before it, never side by side. \
+The SURFACE the pile stands on comes from the user's words:
+  - "in/on the tray": the tray is the yellow slab; the FIRST (base) cube goes "in the tray", every other cube "on top of the <previous cube>".
+  - "on the table" (or no surface named): the pile stands on the TABLE. Never use the tray. The base cube is either left where it is \
+(no step for it) or, if it must move, goes "on a free spot on the table"; every other cube goes "on top of the <previous cube>".
+Choose the order from the live positions - cubes with nothing on top and closest to the robot first - not by colour. Never give \
+several cubes a "tray" destination to stack them.
+
+Example — stack in the tray:
+Instruction: "stack the cubes in the tray"
+[
+  {"action": "pick_place", "target": "red cube", "destination": "in the tray"},
+  {"action": "pick_place", "target": "blue cube", "destination": "on top of the red cube"},
+  {"action": "pick_place", "target": "green cube", "destination": "on top of the blue cube"}
+]
+
+Example — stack on the table (the red cube stays where it is):
+Instruction: "stack the cubes on the table"
+[
+  {"action": "pick_place", "target": "blue cube", "destination": "on top of the red cube"},
+  {"action": "pick_place", "target": "green cube", "destination": "on top of the blue cube"}
+]
+
 Plan exactly what the user actually asked for — nothing more. If the instruction only says \
 to pick up or grasp an object and does not state where to put it, use \
 `"destination": ""` — do not invent a placement (e.g. do not assume "the tray") just because \
@@ -404,6 +592,8 @@ def _normalize_destination(destination: str) -> str:
     name a known cube color, the only sensible reading of "place X <object>" is stacking —
     canonicalize it to say so explicitly, rather than leave it for keyword matching to guess."""
     dest_l = destination.lower()
+    if re.fullmatch(r"\s*(?:the\s+)?(?:table|tabletop|table top)\s*", dest_l):
+        return "on the table"
     if not destination or any(k in dest_l for k in _TRAY_DEST_KEYWORDS) or any(k in dest_l for k in _RELATION_DEST_KEYWORDS):
         return destination
     if any(color in dest_l for color in ("red cube", "blue cube", "green cube", "red", "blue", "green")):
@@ -423,12 +613,39 @@ def _validate_subgoal_shape(item: Any) -> Dict[str, Any]:
     return item
 
 
+def _nemotron_chat(payload: Dict[str, Any]) -> Tuple[Optional[int], Optional[Dict[str, Any]]]:
+    """POST to the configured Nemotron endpoint (hosted NVIDIA API by default). Retries on
+    429 / 5xx / connection errors with backoff — the hosted free tier is rate limited, and a
+    single transient blip should not turn a whole plan into the single-step fallback."""
+    url = f"{cfg.NEMOTRON_BASE_URL}/chat/completions"
+    headers = cfg.auth_headers(cfg.NEMOTRON_API_KEY)
+    status, body = None, None
+    for attempt in range(3):
+        status, body = _http_post_json(url, payload, timeout=NEMOTRON_TIMEOUT_S, headers=headers)
+        if status == 200 or (status is not None and status not in (429, 500, 502, 503, 504)):
+            break
+        if attempt < 2:
+            time.sleep(2.0 * (attempt + 1))
+    return status, body
+
+
+def _message_text(message: Dict[str, Any]) -> str:
+    """Normalises a chat message to the `<reasoning></think><answer>` shape the parsers below
+    expect. A self-hosted vLLM Nemotron inlines its chain-of-thought before `</think>`; the
+    hosted NVIDIA API returns it separately in `reasoning_content` and `content` is answer-only."""
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    if reasoning and "</think>" not in content:
+        return f"{reasoning}</think>{content}"
+    return content
+
+
 def _call_nemotron(instruction: str, scene: Dict[str, Any]) -> str:
     # Plain .replace(), not str.format() — the prompt's literal JSON examples are full of
     # `{...}` braces that str.format() would otherwise try to parse as its own placeholders.
     prompt = NEMOTRON_SYSTEM_PROMPT.replace("{scene_desc}", _describe_scene(scene))
     payload = {
-        "model": "nemotron",
+        "model": cfg.NEMOTRON_MODEL,
         "messages": [
             {"role": "system", "content": prompt},
             {"role": "user", "content": instruction},
@@ -445,12 +662,12 @@ def _call_nemotron(instruction: str, scene: Dict[str, Any]) -> str:
         # 12288 alongside this so the extra completion budget actually fits.
         "max_tokens": 4096,
     }
-    status, body = _http_post_json(f"{NEMOTRON_URL}/v1/chat/completions", payload, timeout=NEMOTRON_TIMEOUT_S)
+    status, body = _nemotron_chat(payload)
     if status != 200 or not body:
         raise RuntimeError(f"Nemotron request failed (status={status})")
     try:
         choice = body["choices"][0]
-        content = choice["message"]["content"]
+        content = _message_text(choice["message"])
         # Surface truncation explicitly rather than letting it masquerade as "no JSON found"
         # further down — this is the exact failure mode that silently broke complex prompts.
         if choice.get("finish_reason") == "length":
@@ -512,6 +729,10 @@ def decompose_task_with_reasoning(
     the plan looks the way it does, not just the resulting steps. Empty string if Nemotron
     was unreachable/failed or returned no visible reasoning."""
     scene = scene if scene is not None else fetch_live_scene()
+    stack = _expand_stack_instruction(instruction, scene)
+    if stack is not None and STACK_PLANNER == "code":
+        log.info(f"'{instruction}' expanded from the live cube positions into {len(stack[0])} subgoal(s) (no LLM call).")
+        return stack
     try:
         raw = _call_nemotron(instruction, scene)
         reasoning, answer = _split_reasoning(raw)
@@ -519,6 +740,9 @@ def decompose_task_with_reasoning(
         log.info(f"Nemotron decomposed '{instruction}' into {len(subgoals)} subgoal(s): {subgoals}")
         return subgoals, reasoning
     except Exception as e:
+        if stack is not None:
+            log.warning(f"Nemotron decomposition unavailable/failed ({e}) — using the deterministic stack planner.")
+            return stack
         log.warning(f"Nemotron decomposition unavailable/failed ({e}) — dispatching instruction directly.")
         return [{"action": "direct", "instruction": instruction}], f"(planning failed: {e})"
 
@@ -628,7 +852,7 @@ def request_failure_decision(
         .replace("{scene_desc}", _describe_scene(scene))
     )
     payload = {
-        "model": "nemotron",
+        "model": cfg.NEMOTRON_MODEL,
         "messages": [
             {"role": "system", "content": prompt},
             {"role": "user", "content": "Diagnose the failure and decide."},
@@ -640,13 +864,13 @@ def request_failure_decision(
         # plain retry/replan_step decision.
         "max_tokens": 3072,
     }
-    status, body = _http_post_json(f"{NEMOTRON_URL}/v1/chat/completions", payload, timeout=NEMOTRON_TIMEOUT_S)
+    status, body = _nemotron_chat(payload)
     if status != 200 or not body:
         log.warning(f"Failure-decision request failed (status={status})")
         return None
     try:
         choice = body["choices"][0]
-        raw = choice["message"]["content"]
+        raw = _message_text(choice["message"])
         if choice.get("finish_reason") == "length":
             log.warning("[Nemotron] Failure-decision response hit max_tokens before finishing.")
     except (KeyError, IndexError, TypeError) as e:
@@ -696,12 +920,134 @@ def subgoal_to_instruction(subgoal: Dict[str, Any]) -> str:
         # "pick up the red cube and place it in the tray" — inventing a placement the user
         # never asked for. Only add a destination clause when Nemotron actually gave one.
         if destination:
-            return f"pick up the {target} and place it {destination}"
+            return f"pick up the {target} and place it {destination}"   
         return f"pick up the {target}"
     raise ValueError(f"Unknown subgoal action: {action!r}")
 
 
 # ─── Orchestrator: Guardrails + Dispatch + Feedback Loop ──────────────────────
+
+# ─── Refusals and the final answer ──────────────────────────────────────────────────────────────────────────
+# The sim REFUSES a step it cannot do (no reachable grasp, no free spot to place it) and says why in
+# /state: last_task_refused / last_task_error. A refusal is deterministic — the same step fails the same way — so it
+# is never retried and no substitute action is made: the step FAILS with the sim's reason quoted verbatim, and the plan carries on with
+# the steps that do not depend on it.
+
+def build_outcome_summary(results: List[Dict[str, Any]], refusal_log: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Deterministic placed / not-placed account of a run, built from the per-step results. Refusal texts are kept
+    verbatim (never paraphrased) so they can be quoted to the user. `refusals` lists EVERY refusal the robot gave
+    during the run, each attributed to the object it was about; `worked_around` is the subset that did not end with
+    that step being given up (a different action was taken instead)."""
+    placed, not_placed = [], []
+    for r in results:
+        sg = r.get("subgoal") or {}
+        if sg.get("action") != "pick_place":
+            continue
+        entry = {"object": sg.get("target", "?"), "wanted": sg.get("destination") or "(no destination)"}
+        if r.get("status") == "DONE":
+            entry["where"] = entry.pop("wanted")
+            placed.append(entry)
+        else:
+            entry["reason"] = r.get("reason") or r.get("status", "not done").lower()
+            entry["refusal"] = (r.get("refusals") or [None])[-1]
+            entry["status"] = r.get("status")
+            not_placed.append(entry)
+    refusals = list(refusal_log or [])
+    final = {e["refusal"] for e in not_placed if e.get("refusal")}
+    return {"placed": placed, "not_placed": not_placed, "refusals": refusals,
+            "worked_around": [r for r in refusals if r["text"] not in final]}
+
+
+def deterministic_answer(instruction: str, summary: Dict[str, Any]) -> str:
+    """Plain-language account without an LLM — also the fallback when Nemotron is unreachable."""
+    lines = []
+    placed, not_placed = summary["placed"], summary["not_placed"]
+    if placed:
+        lines.append("Done: " + "; ".join(f"the {e['object']} is {e['where']}" for e in placed) + ".")
+    for e in not_placed:
+        why = f"the robot refused: \"{e['refusal']}\"" if e.get("refusal") else e["reason"]
+        lines.append(f"Not done: the {e['object']} ({e['wanted']}) — {why}.")
+    if not placed and not not_placed:
+        lines.append("Nothing was done.")
+    for r in summary.get("worked_around", []):
+        lines.append(f"Note: the robot first refused the {r['object']} ({r['wanted']}): \"{r['text']}\" — so a "
+                     f"different action was taken.")
+    if any(e.get("refusal") for e in not_placed):
+        lines.append("You could ask for a different destination, free up space, or move the object named "
+                     "as the blocker first.")
+    return " ".join(lines)
+
+
+FINAL_ANSWER_SYSTEM_PROMPT = """You are the voice of a lab robot arm. Write the final answer to the user, in plain \
+language, 2-6 sentences, no JSON, no markdown. Use ONLY the facts below; invent nothing.
+For every object that was NOT placed say: what the user asked for, what blocked it, and what the user could change \
+(for example another destination, freeing space, or moving the named blocker first). When a robot message is given for it, \
+QUOTE that message exactly, word for word, inside double quotes. Also say which objects WERE placed and where.
+
+User's instruction: {instruction}
+Outcome (JSON): {summary}
+"""
+
+
+def request_final_answer(instruction: str, summary: Dict[str, Any]) -> Optional[str]:
+    payload = {
+        "model": cfg.NEMOTRON_MODEL,
+        "messages": [
+            {"role": "system", "content": FINAL_ANSWER_SYSTEM_PROMPT.replace("{instruction}", instruction)
+                                                                      .replace("{summary}", json.dumps(summary))},
+            {"role": "user", "content": "Write the final answer."},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }
+    status, body = _nemotron_chat(payload)
+    if status != 200 or not body:
+        return None
+    try:
+        _reasoning, answer = _split_reasoning(_message_text(body["choices"][0]["message"]))
+    except (KeyError, IndexError, TypeError):
+        return None
+    return answer.strip() or None
+
+
+def compose_final_answer(instruction: str, summary: Dict[str, Any]) -> str:
+    """The answer shown to the user. All-clear runs use the deterministic text (no LLM call). When anything was not
+    placed or an alternative was needed, Nemotron words it — but the result is CHECKED: every verbatim refusal text
+    and every object name must appear in it, otherwise the missing facts are appended from the deterministic account,
+    so a paraphrasing or forgetful model can never drop what the robot actually said."""
+    needs_llm = bool(summary["not_placed"]) or bool(summary.get("worked_around"))
+    answer = None
+    if needs_llm:
+        try:
+            answer = request_final_answer(instruction, summary)
+        except Exception as e:                      # the answer must never be what breaks a finished run
+            log.warning(f"Final-answer request failed ({e}) — using the deterministic answer.")
+    if not answer:
+        return deterministic_answer(instruction, summary)
+    low = answer.lower()
+    missing = []
+    for e in summary["not_placed"]:
+        if e["object"].lower() not in low or (e.get("refusal") and e["refusal"] not in answer):
+            missing.append(e)
+    for e in summary["placed"]:
+        if e["object"].lower() not in low:
+            missing.append({"object": e["object"], "wanted": e["where"], "reason": "", "placed": True})
+    for r in summary.get("worked_around", []):
+        if r["text"] not in answer:
+            missing.append({"object": r["object"], "wanted": r["wanted"], "refusal": r["text"], "reason": "", "worked_around": True})
+    if missing:
+        extra = []
+        for e in missing:
+            if e.get("placed"):
+                extra.append(f"The {e['object']} is {e['wanted']}.")
+            elif e.get("worked_around"):
+                extra.append(f"Note: the robot first refused the {e['object']} ({e['wanted']}): \"{e['refusal']}\".")
+            else:
+                why = f"the robot said: \"{e['refusal']}\"" if e.get("refusal") else e["reason"]
+                extra.append(f"The {e['object']} ({e['wanted']}) was not placed — {why}.")
+        answer = answer.rstrip() + " " + " ".join(extra)
+    return answer
+
 
 class NeMoRoboticsAgent:
     """Real System-2 orchestrator: Nemotron decomposition -> guardrail gate -> dispatch to the
@@ -758,16 +1104,18 @@ class NeMoRoboticsAgent:
                 return False, f"destination: {reason}"
         return True, "OK"
 
-    def _attach_visual_evidence(self, step: Dict[str, Any], subgoal: Dict[str, Any], enforce: bool) -> None:
-        """Cosmos-Reason2 visual post-condition check (Step 7) — writes evidence fields onto
+    def _attach_visual_evidence(self, step: Dict[str, Any], subgoal: Dict[str, Any], enforce: bool, frame=None) -> None:
+        """Cosmos visual post-condition check (Step 7) — writes evidence fields onto
         `step` for the UI (visual_verified/visual_confidence/visual_observed), never raises,
         never blocks: any failure inside verify_step already degrades to a NOT-CHECKED verdict
         (see step_verifier.py's own docstring on why that's asymmetric with a real disagreement)."""
         try:
             target_name = subgoal.get("target", "")
             destination = subgoal.get("destination")
+            if frame is None:
+                frame = _get_scene_frame()
             verdict = step_verifier.verify_step(
-                _get_scene_frame, action=subgoal.get("action", ""), obj=target_name,
+                lambda: frame, action=subgoal.get("action", ""), obj=target_name,
                 destination=destination, enforce=enforce,
             )
             step["visual_verified"] = verdict.verified
@@ -780,7 +1128,8 @@ class NeMoRoboticsAgent:
                             f"— shown as evidence, does not change step status.")
             COSMOS_REASONING_LOG.add(
                 f"Step {step.get('index')} post-motion visual check ({target_name})",
-                verdict.observed,
+                f"verified={verdict.verified} (confidence {verdict.confidence:.2f})\n{verdict.observed}",
+                image=frame[0] if frame else None,
             )
         except Exception as e:
             # Belt-and-suspenders on top of verify_step's own internal safety — a bug in this
@@ -791,9 +1140,8 @@ class NeMoRoboticsAgent:
             step["visual_confidence"] = 0.0
             step["visual_observed"] = f"NOT CHECKED (internal error: {e})"
 
-    def _attach_cosmos_assessment(self, step: Dict[str, Any], subgoal: Dict[str, Any]) -> None:
-        """Cosmos-Reason2 PRE-dispatch visual reasoning (cosmos_integration.md's "COSMOS
-        REASON 2" panel — target visible / obstacle / feasibility / approach) — writes
+    def _attach_cosmos_assessment(self, step: Dict[str, Any], subgoal: Dict[str, Any], frame=None) -> None:
+        """Cosmos PRE-dispatch visual reasoning (the "Cosmos 3 Nano Reasoner" panel — target visible / obstacle / feasibility / approach) — writes
         cosmos_* fields onto `step` for the UI. Purely informational, same as
         _attach_visual_evidence: never raises, never blocks or changes what gets dispatched.
         Only meaningful for pick_place (home/reset/direct have no target/destination to look
@@ -801,8 +1149,10 @@ class NeMoRoboticsAgent:
         if subgoal.get("action") != "pick_place":
             return
         try:
+            if frame is None:
+                frame = _get_scene_frame()
             verdict = step_verifier.assess_pick_place(
-                _get_scene_frame, target=subgoal.get("target", ""),
+                lambda: frame, target=subgoal.get("target", ""),
                 destination=subgoal.get("destination", ""),
             )
             if not verdict.ok:
@@ -821,11 +1171,36 @@ class NeMoRoboticsAgent:
                      f"— {verdict.reasoning!r}")
             COSMOS_REASONING_LOG.add(
                 f"Step {step.get('index')} pre-dispatch — {subgoal.get('target', '')} → {subgoal.get('destination', '')}",
-                verdict.reasoning,
+                f"feasibility={verdict.feasibility} · obstacle={verdict.obstacle} · approach={verdict.approach}\n{verdict.reasoning}",
+                image=frame[0] if frame else None,
             )
         except Exception as e:
             log.warning(f"[Cosmos] Pre-dispatch assessment failed unexpectedly (non-fatal): {e}")
             step["cosmos_assessment"] = {"error": f"NOT CHECKED (internal error: {e})"}
+
+    def _check_in_background(self, kind: str, step: Dict[str, Any], subgoal: Dict[str, Any], enforce: bool,
+                             emit, pending: List[threading.Thread]) -> None:
+        """Cosmos is evidence only and never gates the arm, so its (seconds-long) check runs next to the motion instead of in
+        front of it. The camera frame is captured HERE, right now, so the check judges this exact moment and not whatever the
+        arm is doing when Cosmos finally answers; the plan view is refreshed when the answer arrives."""
+        frame = _get_scene_frame()
+
+        def work():
+            try:
+                if kind == "assess":
+                    self._attach_cosmos_assessment(step, subgoal, frame=frame)
+                else:
+                    self._attach_visual_evidence(step, subgoal, enforce, frame=frame)
+            except Exception as e:                                   # the attach functions already swallow errors
+                log.warning(f"[Cosmos] background check failed (non-fatal): {e}")
+            finally:
+                try:
+                    emit()
+                except Exception:
+                    pass
+        t = threading.Thread(target=work, daemon=True, name=f"cosmos-{kind}")
+        t.start()
+        pending.append(t)
 
     def _dispatch(self, instruction: str) -> bool:
         """Posts the instruction, then blocks until Isaac Sim's own physics loop has actually
@@ -858,7 +1233,9 @@ class NeMoRoboticsAgent:
         deadline = time.time() + 5.0
         while time.time() < deadline:
             state = _http_get_json(f"{ISAAC_SIM_URL}/state")
-            if state and state.get("busy") and state.get("current_request_id") == my_request_id:
+            # Request id alone confirms the sim dequeued OUR command. busy is not required: a task the sim refuses
+            # at planning time can already be idle again by the next poll, and must not read as "never started".
+            if state and state.get("current_request_id") == my_request_id:
                 return True
             time.sleep(0.05)
         log.warning(f"Sim never confirmed it started processing request #{my_request_id}: {instruction!r}")
@@ -903,9 +1280,26 @@ class NeMoRoboticsAgent:
             if push_log:
                 push_log(msg, level)
 
+        pending_checks: List[threading.Thread] = []       # Cosmos checks running next to the arm (see _check_in_background)
+
         def _emit():
             if on_plan_update:
-                on_plan_update(json.loads(json.dumps(plan)))  # cheap deep copy, JSON-safe
+                for _try in range(3):                      # a background Cosmos check may be updating a step right now
+                    try:
+                        snapshot = json.loads(json.dumps(plan))  # cheap deep copy, JSON-safe
+                        break
+                    except RuntimeError:
+                        time.sleep(0.01)
+                else:
+                    return
+                on_plan_update(snapshot)
+
+        def _finish_checks(max_wait: float = 25.0):
+            """Give the last background Cosmos checks a moment so the finished plan carries their evidence."""
+            deadline = time.time() + max_wait
+            for _t in pending_checks:
+                _t.join(max(0.0, deadline - time.time()))
+            _emit()
 
         def _preview_text(sg):
             try:
@@ -928,14 +1322,24 @@ class NeMoRoboticsAgent:
         plan["planning_reasoning"] = planning_reasoning[:2000] if planning_reasoning else None
         NEMOTRON_REASONING_LOG.add(f"Decompose: {instruction[:80]}", planning_reasoning)
         if not subgoals:
-            msg = "Nemotron found no actionable subgoals (likely references an object not in the live scene)."
+            seen = ", ".join(str(o.get("name", "?")).lower() for o in (scene.get("objects") or {}).values())
+            if planning_reasoning and planning_reasoning.startswith("(the cubes are already"):
+                msg = "The cubes are already stacked in one pile, so there is nothing to do."
+            elif planning_reasoning and planning_reasoning.startswith("(cannot stack"):
+                msg = planning_reasoning.strip("()").replace("cannot stack: ", "I cannot stack the cubes: ", 1)
+            elif planning_reasoning and planning_reasoning.startswith("(fewer than two cubes"):
+                msg = "I can see fewer than two cubes right now, so there is nothing to stack."
+            else:
+                msg = ("I could not turn that into robot steps: it mentions something I cannot see right now. "
+                       + (f"Objects I can currently see: {seen}." if seen else "I cannot see any objects at the moment."))
             _log(f"{msg} — nothing dispatched.", "WARN")
-            plan.update(active=False, overall="REJECTED", reason=msg)
+            plan.update(active=False, overall="REJECTED", reason=msg, answer=msg)
             _emit()
-            return {"status": "REJECTED", "instruction": instruction, "steps": []}
+            return {"status": "REJECTED", "instruction": instruction, "steps": [], "answer": msg}
 
         plan["steps"] = [
-            {"index": i, "text": _preview_text(sg), "subgoal": sg, "status": "PENDING", "detail": None}
+            {"index": i, "text": _preview_text(sg), "subgoal": sg, "status": "PENDING",
+             "detail": None}
             for i, sg in enumerate(subgoals, start=1)
         ]
         plan["overall"] = "RUNNING"
@@ -947,13 +1351,50 @@ class NeMoRoboticsAgent:
         results = []
         completed_subgoals: List[Dict[str, Any]] = []
         remaining_replanned = False  # replan_remaining allowed once per run — safety valve
+        refused_keys: set = set()         # objects the sim refused to move: later steps that depend on them are skipped
+        refusal_log: List[Dict[str, Any]] = []   # every refusal this run, verbatim, attributed to the object it was about
         aborted = False  # set by a hard-stop request — short-circuits straight to ABORTED,
                           # skipping the final-goal check entirely (nothing left to verify)
+        blocker_moves = 0
+        # Closed-loop stacking: the local planner plans again from the LIVE scene before every step (and after a failed one),
+        # so a cube that was dropped, knocked over or moved by hand just produces a new plan from the real state.
+        stack_req = _stack_request(instruction) if STACK_PLANNER == "code" else None
+        stack_fail_replans = 0
+        stack_plan_changes = [0]     # how many times the pile plan was rewritten this run (hard cap below)
+
+        def _replan_stack(from_idx: int, live_scene: Dict[str, Any], why: str) -> None:
+            """Replace every step from `from_idx` on with the local planner's plan for the live scene."""
+            planning_scene = live_scene
+            if refused_keys:       # a cube the robot refused to move (e.g. unreachable) is left out of the plan
+                planning_scene = {**live_scene, "objects": {k: v for k, v in (live_scene.get("objects") or {}).items()
+                                                            if k not in refused_keys}}
+            fresh = sp.plan_stack(planning_scene, stack_req["surface"])
+            new_goals = fresh.goals()
+            if stack_plan_changes[0] >= MAX_STACK_PLAN_CHANGES:
+                return                                      # safety valve: stop rewriting, just finish the plan as it stands
+            old_goals = [{"target": g.get("target"), "destination": g.get("destination")} for g in subgoals[from_idx:]]
+            if [{"target": g["target"], "destination": g["destination"]} for g in new_goals] == old_goals:
+                return
+            _log(f"[Stack planner] {why}: {len(new_goals)} step(s) from here"
+                 + (" - the cubes are already in one pile" if fresh.already else "") + f". {fresh.note}", "INFO")
+            stack_plan_changes[0] += 1
+            subgoals[from_idx:] = new_goals
+            plan["steps"][from_idx:] = [
+                {"index": from_idx + 1 + j, "text": _preview_text(g), "subgoal": g, "status": "PENDING",
+                 "detail": "re-planned from the live positions" if from_idx > 0 else None}
+                for j, g in enumerate(new_goals)
+            ]
+            _emit()
+
         idx = 0
         while idx < len(subgoals):
             if self._stop_event.is_set():
                 aborted = True
                 break
+            if stack_req is not None and idx < len(subgoals) and subgoals[idx].get("action") == "pick_place":
+                _replan_stack(idx, scene, f"step {idx + 1}")
+                if idx >= len(subgoals):
+                    break
             i = idx + 1
             subgoal = subgoals[idx]
             step = plan["steps"][idx]
@@ -969,12 +1410,52 @@ class NeMoRoboticsAgent:
                 idx += 1
                 continue
 
+            if subgoal.get("action") == "pick_place" and blocker_moves < MAX_BLOCKER_MOVES:
+                _tk = _resolve_named_key(subgoal.get("target", ""), scene)
+                _blocker = _stack_blocker(_tk, scene) if _tk else None
+                if _blocker is not None:
+                    blocker_moves += 1
+                    _clear = {"action": "pick_place", "target": _cube_name(scene, _blocker),
+                              "destination": FREE_SPOT_DESTINATION}
+                    _log(f"Step {i}/{n}: the {_cube_name(scene, _tk)} has the {_cube_name(scene, _blocker)} on top of it — "
+                         f"moving the {_cube_name(scene, _blocker)} to a free spot first.", "WARN")
+                    subgoals.insert(idx, _clear)
+                    plan["steps"].insert(idx, {"index": idx + 1, "text": _preview_text(_clear), "subgoal": _clear,
+                                               "status": "PENDING",
+                                               "detail": f"inserted: clears the {_cube_name(scene, _blocker)} off the "
+                                                         f"{_cube_name(scene, _tk)}"})
+                    for _j, _st in enumerate(plan["steps"], start=1):
+                        _st["index"] = _j
+                    _emit()
+                    continue
+
             ok, reason = self.validate_subgoal(subgoal, scene)
+            if not ok and _scene_is_camera_derived(scene) and ("not found" in reason or "out of bounds" in reason):
+                # A camera-derived scene is measured, so a borderline reading (or an object caught
+                # mid-motion / momentarily occluded) can fail the guardrail once and pass on the
+                # next look. Re-observe and re-validate a few times before rejecting — but only for
+                # perception-type failures (not found / out of reach). Not done for the deterministic
+                # scene (exact simulator coordinates — a retry can't change it).
+                for attempt in range(1, GUARDRAIL_RETRIES + 1):
+                    _log(f"[Guardrail] Step {i}/{n} failed on a camera-derived scene ({reason}) — "
+                         f"re-observing (retry {attempt}/{GUARDRAIL_RETRIES})", "WARN")
+                    step.update(detail=f"guardrail retry {attempt}/{GUARDRAIL_RETRIES}: {reason}")
+                    _emit()
+                    time.sleep(GUARDRAIL_RETRY_DELAY_S)
+                    scene = fetch_live_scene()
+                    ok, reason = self.validate_subgoal(subgoal, scene)
+                    if ok:
+                        _log(f"[Guardrail] Step {i}/{n} passed on retry {attempt}.", "INFO")
+                        break
             if not ok:
                 _log(f"[Guardrail] Step {i}/{n} REJECTED: {reason}", "WARN")
                 step.update(status="REJECTED", detail=reason)
                 _emit()
                 results.append({"subgoal": subgoal, "status": "REJECTED", "reason": reason})
+                if stack_req is not None:      # never plan this cube again (the same step would be rejected every time)
+                    _rk = _resolve_named_key(subgoal.get("target", ""), scene)
+                    if _rk:
+                        refused_keys.add(_rk)
                 idx += 1
                 continue
 
@@ -988,11 +1469,11 @@ class NeMoRoboticsAgent:
                 step.update(status="DONE", detail="already at destination — skipped")
                 if subgoal.get("action") == "pick_place":
                     step["final_pos"] = _resolve_named_position(subgoal.get("target", ""), scene)
-                # Cosmos-Reason2 visual check (Step 7) — turns "skipped, assumed already
+                # Cosmos visual check (Step 7) — turns "skipped, assumed already
                 # correct" into "skipped, and the model actually looked and confirmed it".
                 # enforce=False: nothing was dispatched here, so a disagreeing visual read
                 # is evidence worth showing, never a reason to fail an otherwise-correct skip.
-                self._attach_visual_evidence(step, subgoal, enforce=False)
+                self._check_in_background("verify", step, subgoal, False, _emit, pending_checks)
                 _emit()
                 results.append({"subgoal": subgoal, "status": "DONE"})
                 completed_subgoals.append(subgoal)
@@ -1005,7 +1486,7 @@ class NeMoRoboticsAgent:
             # *before* dispatching whether a later step's assumption (e.g. "stack on the red
             # cube") still holds against what's actually happened since. Only escalates to a
             # real Nemotron call when something concrete looks wrong, not on a fixed cadence.
-            drifted, drift_reason = _subgoal_drift_detected(subgoal, scene, plan["steps"][:idx])
+            drifted, drift_reason = (False, "") if stack_req is not None else _subgoal_drift_detected(subgoal, scene, plan["steps"][:idx])
             if drifted:
                 _log(f"Step {i}/{n} pre-dispatch check: {drift_reason}", "WARN")
                 step.update(status="REPLANNING", detail=drift_reason)
@@ -1063,10 +1544,11 @@ class NeMoRoboticsAgent:
                 _emit()
 
             _log(f"Step {i}/{n}: {text}")
-            self._attach_cosmos_assessment(step, subgoal)
+            self._check_in_background("assess", step, subgoal, False, _emit, pending_checks)
             step.update(status="RUNNING", detail=None)
             _emit()
             step_done = False
+            step_refused = False
             final_state = None
             attempt = 1
             while attempt <= MAX_SUBGOAL_ATTEMPTS:
@@ -1117,17 +1599,38 @@ class NeMoRoboticsAgent:
                 # failed grasp gets diagnosed as that, not just a generic position miss.
                 grasp_confirmed = final_state.get("last_grasp_confirmed")
                 displacement_mm = final_state.get("last_object_displacement_mm")
-                failure_desc = f"{err_mm}mm position error"
-                if grasp_confirmed is False:
+                refusal = final_state.get("last_task_error") if final_state.get("last_task_refused") else None
+                failure_desc = (f"the sim refused the task before moving: {refusal}" if refusal
+                                else f"{err_mm}mm position error")
+                if grasp_confirmed is False and not refusal:      # (those two are stale after a refusal: nothing moved)
                     failure_desc += "; grasp NOT confirmed (gripper closed on nothing — likely never actually picked up the object)"
-                if displacement_mm is not None:
+                if displacement_mm is not None and not refusal:
                     failure_desc += f"; object moved {displacement_mm}mm from its starting position"
+                if refusal:
+                    # The sim refused before moving. Quote it verbatim and never retry it (see the policy below).
+                    step.setdefault("refusals", []).append(refusal)
+                    refusal_log.append({"object": subgoal.get("target", "?"), "wanted": subgoal.get("destination") or "",
+                                        "text": refusal})
+                    _log(f"Step {i} REFUSED by the robot: \"{refusal}\"", "WARN")
+                    step.update(status="REPLANNING", detail=f"refused by the robot: {refusal}")
+                    # Policy (user decision): after a refusal the step simply FAILS, with the robot's reason shown. No
+                    # alternative destination or object is ever substituted - doing something other than what was asked
+                    # (another destination, another object) is worse than stopping. No extra model call is made either.
+                    step.update(status="FAILED", refused=True, detail=f"refused by the robot: {refusal}")
+                    _emit()
+                    step_refused = True
+                    break
+                    attempt = 1
+                    continue
+
                 _log(f"Step {i} verification failed (attempt {attempt}/{MAX_SUBGOAL_ATTEMPTS}, "
                      f"{failure_desc})", "WARN")
                 step.update(status="RETRYING", detail=f"{failure_desc} (attempt {attempt}/{MAX_SUBGOAL_ATTEMPTS})")
                 _emit()
                 if attempt >= MAX_SUBGOAL_ATTEMPTS:
                     break
+                if stack_req is not None:
+                    break          # stacking: no model call - the pile is planned again from the live positions below
 
                 fresh_scene = fetch_live_scene()
                 step.update(status="REPLANNING", detail="Nemotron diagnosing the failure...")
@@ -1197,18 +1700,46 @@ class NeMoRoboticsAgent:
                 step["final_pos"] = _resolve_named_position(subgoal.get("target", ""), final_state)
 
             if step_done and subgoal.get("action") == "pick_place":
-                # Cosmos-Reason2 visual check (Step 7): a second, independent signal that the
+                # Cosmos visual check (Step 7): a second, independent signal that the
                 # step actually looks right, not just measures right. Deliberately additive —
                 # this project's real position/grasp/displacement checks above are what
                 # actually decided step_done, and stay the sole authority for DONE/FAILED. A
                 # disagreeing visual read is logged as real evidence on the step (visible in
                 # the UI) rather than silently flipping a passing step to failed; a Cosmos
                 # outage or timeout can never block or stall a plan that's positionally correct.
-                self._attach_visual_evidence(step, subgoal, enforce=True)
+                self._check_in_background("verify", step, subgoal, True, _emit, pending_checks)
 
+            refusals_hist = list(step.get("refusals") or [])
+            if not step_done and step_refused:
+                # Nothing moved, so the world is unchanged: record the refusal (verbatim) and carry on with the rest.
+                last = refusals_hist[-1]
+                step.update(status="FAILED", refused=True, detail=f"refused by the robot: {last}")
+                _log(f"Step {i}/{n} not done — refused by the robot: \"{last}\" — continuing with the remaining steps.", "WARN")
+                _emit()
+                results.append({"subgoal": subgoal, "status": "FAILED", "refused": True, "refusals": refusals_hist,
+                                "reason": f"the robot refused: {last}"})
+                _rk = _resolve_named_key(subgoal.get("target", ""), scene)
+                if _rk:
+                    refused_keys.add(_rk)
+                scene = fetch_live_scene()
+                idx += 1
+                continue
             step.update(status="DONE" if step_done else "FAILED")
             _emit()
-            results.append({"subgoal": subgoal, "status": "DONE" if step_done else "FAILED"})
+            _res = {"subgoal": subgoal, "status": "DONE" if step_done else "FAILED"}
+            if refusals_hist:
+                _res["refusals"] = refusals_hist
+            if not step_done:
+                _res["reason"] = step.get("detail") or "failed"
+            results.append(_res)
+            if not step_done and stack_req is not None and stack_fail_replans < MAX_STACK_REPLANS:
+                stack_fail_replans += 1
+                _log(f"Step {i}/{n} failed - planning the pile again from the live positions "
+                     f"(re-plan {stack_fail_replans}/{MAX_STACK_REPLANS}).", "WARN")
+                scene = fetch_live_scene()
+                _replan_stack(idx + 1, scene, f"after the failed step {i}")
+                idx += 1
+                continue
             if not step_done:
                 _log(f"Aborting remaining plan after step {i}/{n} failed.", "ERROR")
                 for later in plan["steps"][idx + 1:]:
@@ -1235,6 +1766,8 @@ class NeMoRoboticsAgent:
             _emit()
             return {"status": "ABORTED", "instruction": instruction, "steps": results}
 
+        _finish_checks()
+
         # Deterministic final-goal verification (code only, no LLM — requirement is to
         # minimize LLM calls). Every individual placement was already verified when its own
         # step finished; this re-checks that a *later* step didn't physically disturb an
@@ -1246,8 +1779,15 @@ class NeMoRoboticsAgent:
             plan["overall"] = "VERIFYING"
             _emit()
             final_scene = fetch_live_scene()
-            for step in plan["steps"]:
+            for step_no, step in enumerate(plan["steps"]):
                 if step["status"] != "DONE" or step["subgoal"].get("action") != "pick_place":
+                    continue
+                # a later step that moved this same cube on purpose supersedes this step's recorded position
+                _tk_here = _resolve_named_key(step["subgoal"].get("target", ""), final_scene)
+                if _tk_here and any(later["status"] == "DONE" and later["subgoal"].get("action") == "pick_place"
+                                    and later.get("detail") != "already at destination — skipped"
+                                    and _resolve_named_key(later["subgoal"].get("target", ""), final_scene) == _tk_here
+                                    for later in plan["steps"][step_no + 1:]):
                     continue
                 recorded = step.get("final_pos")
                 if not recorded:
@@ -1274,7 +1814,16 @@ class NeMoRoboticsAgent:
                     step["detail"] = oot_reason
                     _log(f"Final goal check: '{step['text']}' no longer holds — {oot_reason}", "WARN")
 
-        if n_done == len(subgoals) and goal_held:
+        stack_verdict = None
+        if stack_req is not None and n_done > 0:
+            # the real goal of a stacking request: every cube in ONE pile on the requested surface (this also covers runs
+            # where a step failed and the pile was planned again from the live positions)
+            stack_verdict = sp.is_stacked(fetch_live_scene(), stack_req["surface"])
+            if not stack_verdict:
+                _log("Final goal check: the cubes are not in one pile on the requested surface.", "WARN")
+        if stack_verdict is not None:
+            overall = "SUCCESS" if stack_verdict else "PARTIAL"
+        elif n_done == len(subgoals) and goal_held:
             overall = "SUCCESS"
         elif n_done == len(subgoals) and not goal_held:
             overall = "GOAL_NOT_HELD"
@@ -1284,6 +1833,9 @@ class NeMoRoboticsAgent:
             overall = "FAILED"
         _log(f"Plan complete: {overall} ({n_done}/{len(subgoals)} subgoals done)",
              "SUCCESS" if overall == "SUCCESS" else "WARN")
-        plan.update(active=False, overall=overall)
+        summary = build_outcome_summary(results, refusal_log)
+        answer = compose_final_answer(instruction, summary)
+        _log(f"[Answer] {answer}", "SUCCESS" if overall == "SUCCESS" else "WARN")
+        plan.update(active=False, overall=overall, answer=answer, summary=summary)
         _emit()
-        return {"status": overall, "instruction": instruction, "steps": results}
+        return {"status": overall, "instruction": instruction, "steps": results, "answer": answer, "summary": summary}

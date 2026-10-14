@@ -4,323 +4,264 @@ title: Physyk Architecture
 
 # Physyk — Architecture
 
-Agentic pick-and-place: a Franka Panda arm in Isaac Sim, commanded in natural language,
-planned by Nemotron-30B, executed by NVIDIA's validated `PickPlaceController`, and
-verified against real simulator telemetry — not scripted, not hardcoded PASS.
+Agentic pick-and-place: a Franka Panda arm in Isaac Sim, commanded in natural language, planned by a local stack planner or by Nemotron, executed by NVIDIA's `PickPlaceController`, and verified against real telemetry (or a fresh camera look). Nothing reports success because a motion finished; success is measured.
 
-This doc covers two levels:
+This doc covers:
 
-1. **How pick-and-place actually executes**, physically, inside Isaac Sim.
-2. **How the agentic orchestration layer** (Nemotron decomposition → guardrails →
-   dispatch → verify → retry/replan) turns a free-form instruction into a sequence of
-   those pick-and-place calls.
+1. The **service topology**.
+2. How **pick-and-place executes**, physically, inside Isaac Sim.
+3. The **agentic layer**: how an instruction becomes a sequence of pick-and-place calls, including the local **stack planner**.
+4. The request lifecycle, state models and known gaps.
+
+Code-level detail (controller phases, planner internals, prompts) is in `TECHNICAL_DEEP_DIVE.md`; the camera-only pipeline is in `PERCEPTION.md`.
 
 ---
 
 ## 1. Service topology
 
-Four independent processes, talking over plain HTTP on localhost. Nothing here is a
-framework abstraction — every arrow below is a real `urllib`/`httpx` call.
+Everything runs on one laptop. Services talk over plain HTTP; only the planner model is remote.
 
 ```mermaid
 flowchart LR
-    subgraph Browser["Browser UI"]
-        UI["physyk_web_server.py\n(GUI, WebSocket log/plan view)"]
+    subgraph Browser["Browser"]
+        UI["GUI (NTT DATA theme)\npolls /state every 150 ms\nlive overview / wrist feeds\nNemotron / Cosmos / Perception log pages"]
     end
 
-    subgraph Bridge["Port 7860"]
-        MAIN["physyk_main_server.py\nAPI/WS gateway + camera proxy"]
+    subgraph Bridge["Port 7860 (.venv python)"]
+        MAIN["physyk_main_server.py\nGUI + gateway + camera proxy"]
+        ORCH["physyk_agent_orchestrator.py\n(imported in-process)\nstack_planner.py"]
     end
 
-    subgraph Cognitive["Port 8000"]
-        NEMO["nemotron_fastapi_server.py\nvLLM, Nemotron-30B, OpenAI-compatible"]
+    subgraph Cognitive["NVIDIA hosted API"]
+        NEMO["Nemotron 3.5 Lightning 30B-A3B\nintegrate.api.nvidia.com/v1"]
     end
 
-    subgraph Physics["Port 8100 — Isaac Sim process"]
-        SIM["isaac_sim_service.py\nPhysX + RMPFlow + PickPlaceController\nsingle command_queue, one task at a time"]
+    subgraph Vision["Port 8001 (Docker NIM)"]
+        COSMOS["Cosmos 3 Nano Reasoner 8B\nFP8, 8192 ctx\nevidence only"]
     end
 
-    subgraph VLA["Port 8300"]
-        GROOT["groot_policy_service.py\nGR00T-N1.7-LIBERO checkpoint (opt-in, 'vla:' prefix)"]
+    subgraph Physics["Port 8100 (Docker: Isaac Sim 6.0.1, headless)"]
+        SIM["isaac_sim_service.py\nPhysX 60 Hz + RMPFlow + PickPlaceController\noverview + wrist cameras\nperception provider\nfactory_background.py (visual only)\none command queue, one task at a time"]
     end
 
-    UI -- "instruction text / WS" --> MAIN
-    MAIN -- "decompose + dispatch\n(physyk_agent_orchestrator.py)" --> NEMO
-    MAIN -- "/execute /state /reset /randomize\n(also camera MJPEG proxy)" --> SIM
-    SIM -- "camera + EE pose -> action chunk" --> GROOT
-    MAIN -. "10Hz telemetry poll /state" .-> SIM
+    UI -- "instruction (REST); /state polled" --> MAIN
+    MAIN --> ORCH
+    ORCH -- "decompose / failure decisions" --> NEMO
+    ORCH -- "/execute /state (dispatch + verify)" --> SIM
+    ORCH -- "pre / post step image checks\n(background threads)" --> COSMOS
+    MAIN -- "/reset /randomize /perception_mode\ncamera MJPEG proxy" --> SIM
+    MAIN -. "10 Hz /state poll" .-> SIM
+    MAIN -. "docker inspect: is the sim container running?" .-> SIM
 ```
-
-**Key files by role:**
 
 | Role | File | Port |
 |---|---|---|
-| Gateway / GUI backend, camera proxy, WS broadcast | `physyk_main_server.py` | 7860 |
-| Agentic orchestrator (Nemotron client, guardrails, dispatch/verify loop) | `physyk_agent_orchestrator.py` | — (imported by main server) |
-| Nemotron-30B server (vLLM, OpenAI-compatible) | `nemotron_fastapi_server.py` | 8000 |
-| Isaac Sim physics + PickPlaceController + telemetry + camera streams | `isaac_sim_service.py` | 8100 |
-| GR00T-N1.7-LIBERO VLA inference server (separate venv) | `groot_policy_service.py` | 8300 |
-| Legacy/dead motion code (unreachable, candidate for deletion) | `physyk_lula_controller.py` | — |
+| GUI and gateway, camera proxy, log pages | `physyk_main_server.py` | 7860 |
+| Agent: planning, guardrails, dispatch / verify / retry | `physyk_agent_orchestrator.py` | — (imported by the main server) |
+| Local stack planner and the shared safe-zone rules | `stack_planner.py` | — (imported by the orchestrator and the sim) |
+| Isaac Sim physics, controller, telemetry, cameras, perception wiring | `isaac_sim_service.py` | 8100 |
+| Visual-only backdrop | `factory_background.py` | — (runs inside the sim) |
+| Perception: detector, provider, overlay layout | `physyk_perception/` | — (runs inside the sim) |
+| Cosmos client and step verifier | `physyk_perception/cosmos_client.py`, `step_verifier.py` | — |
+| Endpoints, keys, model names | `physyk_config.py` (`.env`) | — |
+| Launchers | `run.sh`, `start_sim_docker.sh`, `start_cosmos_docker.sh` | — |
+
+Isaac Sim runs in a container because the host OS (Ubuntu 26.04) is newer than Isaac Sim supports; Cosmos and Isaac Sim share one 24 GB GPU. The sim service is headless inside the container; the GUI is the viewport. The container mounts `workspace/` read-write, so the sim reads the code from the repo (a code change needs a sim restart; the backdrop can be rebuilt live).
 
 ---
 
-## 2. Pick-and-place — the physical execution primitive
+## 2. Pick-and-place — the physical primitive
 
-This is the one reliable primitive everything else is built on: **one named object →
-one resolved 3D position → NVIDIA's validated `PickPlaceController`.** It lives entirely
-inside `isaac_sim_service.py`'s single-threaded sim loop (PhysX + RMPFlow — no LLM
-involved at this layer).
+The reliable primitive everything is built on: **one named object → one resolved 3D position → NVIDIA's `PickPlaceController`.** It lives entirely inside `isaac_sim_service.py`'s single-threaded sim loop (PhysX + RMPFlow; no LLM at this layer).
 
 ```mermaid
 flowchart TD
-    A["POST /execute\n{instruction: 'pick up the green cube\nand place it right of red cube in tray'}"] --> B["command_queue.put((request_id, instruction))"]
-    B --> C{"sim loop:\nactive_pick_place is None\nAND queue not empty?"}
-    C -- "no, busy" --> C
+    A["POST /execute\n{instruction: 'pick up the green cube\nand place it on top of the red cube'}"] --> B["command_queue.put((request_id, instruction))"]
+    B --> C{"sim loop: idle and queue not empty?"}
+    C -- "no" --> C
     C -- "yes" --> D["resolve_pick_place_targets(instruction)"]
 
-    D --> D1["_find_object_mentions()\nkeyword-match cube/tray names by\nstring position in instruction"]
-    D1 --> D2{"spatial relation phrase found?\n(right of / left of / on top of / ...)"}
-    D2 -- "yes" --> D3["reference_key = object named\nAFTER the relation phrase\npick target = first OTHER mention"]
-    D2 -- "no" --> D4["pick target = first object mentioned"]
-    D3 --> E
-    D4 --> E["picking_position = live position\nof target (get_live_object_pos,\nreal USD query, not cached)"]
-    E --> F{"destination type?"}
-    F -- "stack (on top of X)" --> F1["placing = ref_pos + [0,0, 2*CUBE_HALF_HEIGHT]"]
-    F -- "relation + tray words" --> F2["placing = ref_pos + offset,\nclamped into tray bounds,\nz = tray surface + cube half-height"]
-    F -- "'tray'/'bin'/'sort'/... in text" --> F3["_pick_free_tray_slot():\ncenter -> left -> right,\nfirst slot not occupied by\nanother live cube"]
-    F -- "no destination" --> F4["placing = picking\n(pick then set back down)"]
+    D --> D1["find the objects named in the instruction\n(keyword match by position in the text)"]
+    D1 --> D2{"destination?"}
+    D2 -- "on top of X" --> F1["place = top of X's pile + one cube height"]
+    D2 -- "right of / next to X" --> F2["place = X + offset (kept inside the tray if the tray is named)"]
+    D2 -- "tray" --> F3["first free tray slot (centre, left, right)"]
+    D2 -- "free spot / on the table" --> F5["stack_planner.find_free_spot():\nsafe zone, clear of the tray and every cube,\ncheapest carry"]
+    D2 -- "none" --> F4["place = pick spot (set it back down)"]
 
-    F1 --> G["matched_target, picking_position,\nplacing_position, target_name, reference_key"]
+    F1 --> G["picking / placing position"]
     F2 --> G
     F3 --> G
+    F5 --> G
     F4 --> G
 
-    G --> H["pick_place_controller.reset()\nDisable target (+ reference, if stacking)\nas RMPFlow obstacles; keep every\nOTHER cube/tray as real obstacles"]
-    H --> I["active_pick_place = {...}\nsim_telemetry.busy = True"]
-
-    I --> J["every sim frame:\npick_place_controller.forward(\n  picking_position, placing_position,\n  current_joint_positions, EE_OFFSET)"]
-    J --> K["10-phase grasp state machine\n(NVIDIA PickPlaceController, RMPFlow cspace)"]
-
-    K --> P0["0 Moving Above Target"]
-    P0 --> P1["1 Descending to Grasp"]
-    P1 --> P2["2 Settling Before Grasp"]
-    P2 --> P3["3 Closing Gripper\n(held_object_key = target)"]
-    P3 --> P4["4 Lifting"]
-    P4 --> P5["5 Transporting to Place XY"]
-    P5 --> P6["6 Descending to Place Height"]
-    P6 --> P7["7 Releasing Gripper\n(held_object_key = None)"]
-    P7 --> P8["8 Ascending"]
-    P8 --> P9["9 Returning to Staging Position"]
-
-    P9 --> L{"pick_place_controller.is_done()?"}
+    G --> H["pick_place_controller.reset(); re-register RMPFlow obstacles"]
+    H --> I["busy = True"]
+    I --> J["every sim frame: controller.forward(picking, placing, joints)"]
+    J --> K["10-phase state machine (NVIDIA PickPlaceController)"]
+    K --> L{"is_done()?"}
     L -- "no" --> J
-    L -- "yes" --> M["REAL post-place verification:\nfinal_pos = get_live_object_pos(target)\nerr_xy = hypot(dx, dy) vs POSITION_XY_TOLERANCE_M\nerr_z = abs(dz) vs POSITION_Z_TOLERANCE_M"]
-    M --> N{"err_xy AND err_z\nwithin tolerance?"}
-    N -- "yes" --> O1["last_task_success = True\nlast_task_error_mm = err_xy"]
-    N -- "no" --> O2["last_task_success = False\nlast_task_error_mm = err_xy"]
-    O1 --> Q["re-enable target/reference as obstacles\nactive_pick_place = None, busy = False\nstage = READY"]
-    O2 --> Q
+    L -- "yes" --> M["REAL verification:\nfinal position (stage pose, or a fresh camera look)\nvs the target, grasp width, displacement"]
+    M --> N["last_task_success / last_task_error_mm published in /state\nbusy = False"]
 ```
 
-**Notable engineering details baked into this path** (from `PLAN.md`, verified live —
-not aspirational):
+The 10 phases: move above the target, descend to grasp, settle, close the gripper, lift, transport, descend to place height, release, ascend, return to staging. The controller is **open-loop**: each phase advances a timer and never looks at the arm.
 
-- Joints are PD-driven through real PhysX (`ArticulationAction`), not
-  `set_joint_positions()` snapping — the earlier version bypassed physics entirely.
-- `panda_finger_joint2` originally shipped with zero drive strength (one-finger grasp
-  bug) — fixed at the asset level.
-- Obstacles are registered with RMPFlow (table, tray, other cubes) and
-  disabled/re-enabled per-task so the arm can approach the object it's actually
-  grasping without RMPFlow treating it as something to avoid.
-- `resolve_pick_place_targets` uses the target's **live** Z, not an assumed
-  table-height constant — needed for picking a cube that's already stacked.
-- Verification (`last_task_success` / `last_task_error_mm`) used to be a hardcoded
-  `position_error_mm: 0.0` / always-PASS stub; it is now a real position comparison —
-  this is the load-bearing signal the orchestrator's retry/replan logic depends on.
-- Every `/execute` call gets a unique `request_id`; `current_request_id` in `/state`
-  lets a caller confirm the sim actually started *this* dispatch (not stale telemetry
-  from a previous or concurrent command) — see §4 below.
+Details baked into this path:
 
-**Alternate executor — GR00T-N1.7 VLA (`vla:` prefix, opt-in):** live camera + EE pose →
-real forward pass on the LIBERO checkpoint (port 8300) → 16-step delta action chunk →
-RMPFlow execution, re-observing every chunk (max 4 chunks/task). Genuinely
-image-conditioned (verified: 3 different synthetic images → 3 different predicted
-actions), but out-of-domain for this scene, so `PickPlaceController` remains the
-default path; VLA is a stretch/demo path, not what the orchestrator dispatches to.
+- Joints are PD-driven through PhysX (`ArticulationAction`), not teleported.
+- `panda_finger_joint2` ships with zero drive strength in the default gripper variant (a one-finger grasp bug); the sim selects the validated `AlternateFinger` variant and, if a finger still has no drive, applies finger 1's gains to both.
+- The target's **live** Z is used, not a table-height constant, so a stacked cube can be picked.
+- **Grasp confirmation** is physical: at the close-to-lift transition the gripper's achieved width is checked against a minimum; a grasp that closed on nothing aborts instead of carrying nothing across the table.
+- Every `/execute` call gets a unique `request_id`; `current_request_id` in `/state` lets the caller confirm the sim started *this* dispatch.
+- A task the sim **refuses** at planning time (no free spot, target not seen) sets `last_task_refused` and `last_task_error`; the agent quotes the reason and does not retry it.
+
+**Where the coordinates come from — two modes (GUI switch).** Deterministic (default): poses are read from the simulator's scene graph. Pure perception: the same resolver runs, but every pose comes from the overview camera, the tray is a fixed constant, and verification is a fresh camera look. A cube the camera cannot see is absent and the task is refused. Detail: `PERCEPTION.md`.
 
 ---
 
-## 3. Agentic orchestration — Nemotron-driven plan → guardrail → dispatch → verify loop
+## 3. Agentic orchestration — plan → guardrail → dispatch → verify
 
-This is `physyk_agent_orchestrator.py`'s `NeMoRoboticsAgent.run()` — the actual
-hackathon deliverable per `PLAN.md` Part 2. It is a pure HTTP client of two already-
-running servers (Nemotron on 8000, Isaac Sim on 8100); no model is loaded in-process,
-so it stays cheap to import into `physyk_main_server.py`'s plain-python3 process.
+`physyk_agent_orchestrator.py`'s `NeMoRoboticsAgent.run()` is an HTTP client of the Nemotron API, Isaac Sim (:8100) and Cosmos (:8001). No model is loaded in-process.
 
 ```mermaid
 flowchart TD
-    START(["free-form instruction arrives\nvia physyk_main_server.py execute_instruction()"]) --> CTRL{"plain control command?\n(reset/home/randomize/'vla:')"}
-    CTRL -- "yes" --> DIRECT["_forward_direct_to_isaac()\nsingle-shot, no LLM"]
-    CTRL -- "no" --> LOCK{"_orchestrator_lock\nfree?"}
-    LOCK -- "no" --> BUSY(["reject: orchestrator\nalready running a plan"])
-    LOCK -- "yes" --> RUN["NeMoRoboticsAgent.run()\n(background thread)"]
+    START(["instruction arrives via the GUI"]) --> CTRL{"plain control command?\n(reset / home / randomize)"}
+    CTRL -- "yes" --> DIRECT["forward straight to the sim (no LLM)"]
+    CTRL -- "no" --> RUN["NeMoRoboticsAgent.run() (background thread)"]
 
-    RUN --> SCENE["fetch_live_scene()\nGET isaac_sim_service /state\n(real object positions, not cached)"]
-    SCENE --> DECOMP["decompose_task():\nPOST Nemotron /v1/chat/completions\nsystem prompt = scene description +\nsubgoal-shape spec, temperature=0"]
-    DECOMP --> PARSE["_parse_subgoals():\nstrip chain-of-thought before </think>,\ntake LAST JSON array in the answer"]
-    PARSE --> EMPTY{"subgoals empty\nor unparsable?"}
-    EMPTY -- "unparsable/unreachable" --> FALLBACK["fallback: single 'direct' subgoal\n= dispatch instruction verbatim"]
-    EMPTY -- "empty (legit — no\nmatching object)" --> REJECT(["overall = REJECTED\nnothing dispatched"])
-    EMPTY -- "no" --> STEPLOOP
+    RUN --> SCENE["GET /state: the live scene"]
+    SCENE --> KIND{"a stacking request?\n(stack / pile / tower, no colour named,\nno 'and' / 'then')"}
+    KIND -- "yes" --> LOCAL["stack_planner.plan_stack(scene, surface)\nno model call"]
+    KIND -- "no" --> NEMO["Nemotron: decompose into subgoals\n(scene + subgoal spec, temperature 0)"]
+    LOCAL --> EMPTY
+    NEMO --> EMPTY{"any steps?"}
+    EMPTY -- "none: already stacked /\nout of reach / not visible" --> REJ(["REJECTED with a plain reason"])
+    EMPTY -- "yes" --> LOOP
 
-    FALLBACK --> STEPLOOP["for each subgoal, in order:"]
-
-    subgraph STEP["Per-subgoal loop"]
+    subgraph LOOP["per step"]
         direction TB
-        S1["validate_subgoal():\nPhysicalWorkspaceRails.validate_cartesian_target()\nreject targets outside\nx:[0.20,0.70] y:[-0.45,0.45] z:[0.02,0.50]"]
-        S1 -- "fails guardrail" --> S1R(["REJECTED, skip step"])
-        S1 -- "passes" --> S2{"_subgoal_already_satisfied()?\n(deterministic position check —\nis target already at destination)"}
-        S2 -- "yes" --> S2D(["DONE — skipped, no re-dispatch"])
-        S2 -- "no" --> S3{"_subgoal_drift_detected()?\n(pre-dispatch perceive check:\nreference object out of tray, OR\nmoved since an earlier step\nverified its placement)"}
-        S3 -- "drifted" --> S3F["request_failure_decision()\n(Nemotron diagnoses BEFORE dispatch)"]
-        S3F --> S3D["apply decision: replan_step /\nreplan_remaining (once/run) / proceed"]
-        S3D --> S4
-        S3 -- "no drift" --> S4["subgoal_to_instruction()\n-> plain text, e.g.\n'pick up the X and place it Y'"]
-        S4 --> S5["_dispatch(): POST /execute,\nblock until /state.current_request_id\n== our request_id (confirms THIS\ndispatch was actually dequeued)"]
-        S5 --> S6["_wait_for_idle(): poll /state\nuntil busy=False, timeout=150s\n(timeout counts as FAILED,\nnever a silent success)"]
-        S6 --> S7{"subgoal.action == pick_place?"}
-        S7 -- "no (home/reset/direct)" --> S9D(["DONE"])
-        S7 -- "yes" --> S8{"last_task_success == True?\n(real telemetry from §2's\nverification step)"}
-        S8 -- "yes" --> S9D
-        S8 -- "no, attempts remain\n(max 3)" --> S10["request_failure_decision():\nNemotron sees real error_mm,\ncompleted steps, remaining plan,\nlive scene -> retry / replan_step /\nreplan_remaining (once/run)"]
-        S10 --> S5
-        S8 -- "no, attempts exhausted" --> S9F(["FAILED —\nabort remaining plan,\nmark later steps ABORTED"])
+        R0["stack requests: plan again from the live scene\n(replaces every step not yet run)"]
+        R0 --> S0{"cube on top of the target?"}
+        S0 -- "yes (max 4/run)" --> S0I["insert: move the top cube to a free table spot"]
+        S0 -- "no" --> S1["guardrail: workspace box + radius 0.36 m\n(camera scenes re-observe up to 3x)"]
+        S0I --> S0
+        S1 --> S2{"already satisfied?"}
+        S2 -- "yes" --> SKIP(["DONE, skipped"])
+        S2 -- "no" --> S4["dispatch /execute; wait for idle\n(Cosmos pre-check starts in a background thread)"]
+        S4 --> S8{"verified?"}
+        S8 -- "yes" --> OK(["DONE\n(Cosmos post-check in a background thread)"])
+        S8 -- "refused by the sim" --> REF(["FAILED with the sim's reason; not retried"])
+        S8 -- "no (stack request)" --> RP["plan the pile again from the live positions\n(max 6 re-plans)"]
+        S8 -- "no (other steps)" --> DEC["Nemotron: retry / replan_step / replan_remaining"]
     end
 
-    STEPLOOP --> STEP
-    STEP -- "next subgoal" --> STEP
-    STEP -- "all subgoals processed" --> FINAL["Deterministic final-goal check\n(code only, NO extra LLM call):\nre-compare every DONE step's\nrecorded final_pos against its\nCURRENT live position — did a\nLATER step disturb an EARLIER,\nalready-verified placement?"]
-
-    FINAL --> VERDICT{"overall verdict"}
-    VERDICT -- "all done + goal holds" --> SUCCESS(["SUCCESS"])
-    VERDICT -- "all done, later step\ndisturbed an earlier one" --> GNH(["GOAL_NOT_HELD"])
-    VERDICT -- "some done, some failed" --> PARTIAL(["PARTIAL"])
-    VERDICT -- "none done" --> FAILED(["FAILED"])
-
-    SUCCESS --> EMIT["on_plan_update(plan) after every\nstate transition -> sim_state.plan\n-> WS broadcast -> live GUI plan view"]
-    GNH --> EMIT
-    PARTIAL --> EMIT
-    FAILED --> EMIT
+    LOOP --> FINAL["final check (code only): every cube in ONE pile on the surface\n(stack requests) / no earlier placement disturbed"]
+    FINAL --> OUT(["SUCCESS / GOAL_NOT_HELD / PARTIAL / FAILED + a plain-language answer"])
 ```
 
-### Why the failure-handling loop looks the way it does
+The plan dict is pushed to the GUI after every transition (`on_plan_update`), which is what drives the live plan card.
 
-Each design choice below closes a *specific, live-reproduced* bug — not a hypothetical:
+### 3.1 The local stack planner (`stack_planner.py`)
 
-- **`request_id`-based dispatch confirmation** (`_dispatch`) is the third iteration. Plain
-  polling-for-idle raced the ~7-8fps sim loop; `busy=True` alone was true for *anyone's*
-  in-flight task; text-matching the instruction broke on identical retries. A unique
-  per-call `request_id`, echoed back in `/state.current_request_id`, removes all three
-  ambiguities.
-- **Timeout ≠ success.** `_wait_for_idle` timing out used to fall through to reading
-  `last_task_success`, which is leftover state from whatever task last genuinely
-  finished — possibly unrelated. A timeout is now always a failed attempt.
-- **Precondition check (`_subgoal_already_satisfied`)** — re-running a compound
-  instruction like "stack red, green, blue" after red is already placed used to
-  re-pick a correctly-placed cube instead of recognizing the goal already held.
-- **Pre-dispatch drift check (`_subgoal_drift_detected`)** — two independent checks:
-  (1) absolute — is a stacking reference *actually* in the tray right now, not just
-  unchanged since last look; (2) relative — has a reference object moved beyond
-  tolerance since the earlier step that placed it was verified. Neither alone caught
-  both real failure modes observed live (a cube that fell out of the tray and just sat
-  there wrong vs. a reference cube that got knocked by a later grasp).
-- **One LLM call per failure**, not a fixed retry-then-give-up schedule and not a
-  separate "decide" + "replan" call — `request_failure_decision()` returns
-  `retry` / `replan_step` / `replan_remaining` (capped at once per run, to prevent a
-  runaway replan loop) in a single structured response.
-- **Deterministic final-goal check** — every individual step can verify PASS on its
-  own and the *original* compound goal can still be false if a later step (e.g. a
-  stack) physically disturbed an earlier, already-verified placement. This check is
-  pure position math against telemetry, deliberately not another LLM call.
+"Stack the cubes" is a vertical pile, so the planner works from **positions only, never colour**:
+
+- **Columns.** Cubes within 3.5 cm in XY and one layer apart form a column (bottom to top). A cube with something on top is covered and can never be picked, so piles are always taken apart from the top.
+- **Pile site.** Either an existing column on the requested surface (its base stays where it is) or, when none exists, a new base: an uncovered cube carried into the tray (tray requests) or onto a free table spot (table requests). The plan with the fewest moves wins; ties go to the cheapest (carry distance, hand-collision risk, pile not too close to the base).
+- **Order.** Every cube outside the pile goes onto the pile top, in the cheapest valid order. The nearest cube goes first on ties. The open fingers straddle a cube along world Y, so a neighbour beside a cube (or beside the pile) along Y raises the cost of that order.
+- **Surfaces.** `tray`: the base stands in the tray. `table`: the pile stands on the table, never in the tray. None: wherever the biggest reachable column already is.
+- **Out of reach.** A cube the arm cannot reach cannot be picked or stacked on, so the planner refuses up front and names it. It does not loop.
+- **Closed loop.** The agent calls the planner again before every step and after a failed one, so a dropped, knocked or moved cube just produces a new plan from the real state. A hard cap (12 rewrites per run) is the loop guard. A cube the guardrail or the sim refused is left out of later plans.
+
+The same module defines the **safe zone** used wherever the system places a cube (Randomize and "a free spot on the table"): 0.42-0.62 m from the robot base, inside the reachable box, at least 12 cm from the tray, and (Randomize) 12 cm between cubes; a free spot is also at least 15 cm from every other cube. The sim imports it, so the planner, Randomize and the free-spot search cannot disagree.
+
+Prompts that name colours or sequence steps ("put red on blue, then ...") go to Nemotron. `PHYSYK_STACK_PLANNER=llm` also sends plain stacking requests there; the code planner stays as the fallback when Nemotron fails.
+
+### 3.2 Why the loop looks the way it does
+
+Each choice closes a live-reproduced bug:
+
+- **`request_id` dispatch confirmation**: polling for idle raced the sim loop; `busy=True` alone was true for anyone's task.
+- **Timeout is not success**: a timeout used to fall through to the previous task's leftover `last_task_success`.
+- **Precondition check**: re-running a compound instruction re-picked an already-placed cube.
+- **One LLM call per failure**: Nemotron sees the real error, the completed steps and the live scene and answers `retry`, `replan_step` or `replan_remaining` (the last once per run). Stacking skips this and re-plans locally.
+- **Refusals** are quoted verbatim and never retried, so the agent cannot invent a substitute action.
+- **Final-goal check** in code: every step can pass while a later step disturbs an earlier placement. A cube a later step moved on purpose is not counted as disturbed.
+- **Guardrail floor at -0.01 m**: a cube centre rests at 0.025 m but can sink a few millimetres into the table.
+- **Cosmos beside the arm**: its checks take seconds and never gate the arm, so they run in background threads. The camera frame is captured when the check is launched, so it judges that moment, not whatever the arm is doing when Cosmos answers.
 
 ---
 
-## 4. Full request lifecycle — a single compound instruction
+## 4. Full request lifecycle
 
-End-to-end trace for something like *"put the green cube in the tray, then stack the
-blue cube on the red cube"*, tying §1–§3 together with concrete field names.
+*"stack the cubes in the tray"*:
 
 ```mermaid
 sequenceDiagram
-    participant UI as GUI (physyk_web_server.py)
+    participant UI as GUI
     participant MAIN as physyk_main_server.py :7860
     participant ORCH as NeMoRoboticsAgent (in-process)
-    participant NEMO as nemotron_fastapi_server.py :8000
     participant SIM as isaac_sim_service.py :8100
+    participant COS as Cosmos :8001
 
-    UI->>MAIN: POST instruction (WS or REST)
-    MAIN->>MAIN: _is_control_command? no -> orchestrator path
+    UI->>MAIN: POST instruction
     MAIN->>ORCH: run(instruction) [background thread]
     ORCH->>SIM: GET /state (live scene)
-    SIM-->>ORCH: object positions, tray occupancy
-    ORCH->>NEMO: POST /v1/chat/completions (scene + instruction)
-    NEMO-->>ORCH: JSON subgoal array (after </think>)
-    ORCH->>ORCH: guardrail validate_subgoal() per step
+    ORCH->>ORCH: stack_planner.plan_stack(scene, "tray")
 
-    loop each subgoal
+    loop each step
+        ORCH->>ORCH: plan again from the live scene
+        ORCH->>ORCH: guardrail
+        ORCH-)COS: pre-check (background thread, frame captured now)
         ORCH->>SIM: POST /execute {instruction, request_id}
-        SIM-->>ORCH: {status: accepted, request_id}
-        ORCH->>SIM: poll GET /state until current_request_id matches & busy
-        SIM->>SIM: resolve_pick_place_targets -> PickPlaceController\n10-phase state machine, real PhysX
-        ORCH->>SIM: poll GET /state until busy=False
+        SIM->>SIM: resolve targets, 10-phase controller, real PhysX
+        ORCH->>SIM: poll /state until busy = False
         SIM-->>ORCH: last_task_success, last_task_error_mm
-        alt verification failed & attempts remain
-            ORCH->>NEMO: POST diagnose failure (error, scene, completed, remaining)
-            NEMO-->>ORCH: retry / replan_step / replan_remaining
-        end
+        ORCH-)COS: post-check (background thread, frame captured now)
+        ORCH->>MAIN: on_plan_update(plan)
     end
 
     ORCH->>SIM: GET /state (final scene)
-    ORCH->>ORCH: deterministic final-goal re-check
-    ORCH->>MAIN: on_plan_update(plan) each transition
-    MAIN->>UI: WS broadcast sim_state.plan (live agent-thinking view)
+    ORCH->>ORCH: one pile on the tray?
+    UI->>MAIN: GET /state (polled) -> plan, answer
 ```
 
 ---
 
-## 5. State model reference
+## 5. State models
 
-**`isaac_sim_service.py` → `sim_telemetry`** (polled by main server at 10Hz, source of
-truth for the physical robot):
+**`isaac_sim_service.py` → `sim_telemetry`** (read through `/state`):
 
 ```
-joints, gripper, ee_pos, stage, busy, last_instruction, fps,
-current_request_id, last_task_success, last_task_error_mm
+joints, gripper, ee_pos, stage, busy, last_instruction, fps, current_request_id,
+last_task_success, last_task_error_mm, last_task_error, last_task_refused,
+last_grasp_confirmed, last_object_displacement_mm, objects
 ```
 
-**`physyk_agent_orchestrator.py` → `plan` dict** (drives the live agent-thinking UI via
-`on_plan_update`, independent of the text log):
+`objects` carries each cube's name and position; in camera-only mode each entry is tagged `source: camera` and the tray `fixed calibration`.
+
+**`physyk_agent_orchestrator.py` → plan dict** (drives the live plan card):
 
 ```
 {
-  instruction, active, overall: PLANNING|RUNNING|VERIFYING|
-                                 SUCCESS|GOAL_NOT_HELD|PARTIAL|FAILED|REJECTED,
+  instruction, active, answer, planning_reasoning,
+  overall: PLANNING | RUNNING | VERIFYING | SUCCESS | GOAL_NOT_HELD | PARTIAL | FAILED | REJECTED | ABORTED,
   steps: [
     { index, text, subgoal: {action, target, destination},
-      status: PENDING|RUNNING|RETRYING|REPLANNING|DONE|FAILED|REJECTED|ABORTED,
-      detail, final_pos }
+      status: PENDING | RUNNING | RETRYING | REPLANNING | DONE | FAILED | REJECTED | ABORTED,
+      detail, final_pos, refused, cosmos_assessment, visual_verified / visual_observed }
   ]
 }
 ```
 
 ---
 
-## 6. Known gaps (honest, per `PLAN.md`)
+## 6. Known gaps
 
-- GR00T-N1.7-LIBERO VLA path does real inference but does not reliably complete the
-  task on this scene (out-of-domain checkpoint, not fine-tuned here) — kept opt-in,
-  `PickPlaceController` is the default/reliable executor.
-- No N-trial randomized batch success-rate run yet (real verification only landed
-  recently — this is the natural next measurement).
-- `physyk_lula_controller.py` is confirmed dead code (unreachable legacy-namespace
-  bug) — candidate for deletion, not currently wired into any live path.
+- **Reach:** the hand points straight down; cubes between about 0.38 m and 0.66 m from the base can be grasped. Closer, the wrist reaches its joint limit and the grasp fails. Randomize and the free-spot search stay inside a stricter safe zone, and the agent refuses closer targets.
+- **Controller timing:** the controller is an open-loop timer and the hand is not turned to the cube's faces. Long sideways transports can overshoot the destination, and a rare joint swing was observed on the earlier controller. Details and what is known: `TECHNICAL_DEEP_DIVE.md` §5. These have not been re-measured on this controller.
+- **Cubes touching** each other: the planner orders picks to keep the open fingers clear where it can, but the hand cannot turn away from a neighbour.
+- **Pure perception** is scoped to three coloured cubes on the known table; the tray is a fixed constant. Lower cubes in a stack are less precise because their top faces are hidden.
+- **Speed:** wall time per pick is set by the loop rate, because the controller counts phases per loop iteration. The idle loop runs at about 60 iterations/s with the two cameras and the trimmed render path (it was 6-7 with five cameras and a duplicate render). Pick wall time on this controller has not been timed.
+- **Nemotron latency:** the 30B model reasons at length even for one-step prompts (20-50 s). Stacking no longer waits on it.
+- Cosmos is not started or stopped by `run.sh` (use `start_cosmos_docker.sh`).

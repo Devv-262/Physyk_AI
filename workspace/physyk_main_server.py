@@ -11,7 +11,9 @@ Physyk — Franka Panda Physical AI Control Server & Isaac Sim 6.0.1 Bridge
 
 import sys
 import os
+import re
 import json
+import subprocess
 import time
 import asyncio
 import threading
@@ -30,16 +32,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# Real Phase 5 agentic orchestrator (Nemotron decomposition + guardrails + dispatch/verify
-# loop) — pure HTTP client of the Nemotron (8000) and Isaac Sim (8100) servers, so it's cheap
-# to import here under plain python3. Previously this block also imported/instantiated
-# GR00TN17PolicyService() (which loads a real model in-process) and an unused ROS2RGBDBridge;
-# neither is used by anything in this file — the real GR00T VLA path lives entirely in its own
-# server (port 8300) plus isaac_sim_service.py's HTTP client of it. GR00TN17PolicyService()
-# also can't actually load here (the `gr00t` package isn't installed under plain python3,
-# only in Isaac-GR00T/.venv) — confirmed it was silently failing and getting swallowed by the
-# `except ImportError` below (ModuleNotFoundError is a subclass of ImportError) every time
-# this server started, so nemo_agent was never actually usable. Removed both.
+# Real agentic orchestrator (Nemotron decomposition + guardrails + dispatch/verify loop) — a pure HTTP
+# client of the Nemotron (8000) and Isaac Sim (8100) servers.
 # Non-agentic test mode (run.sh --no-agent, or PHYSYK_AGENTIC=0 directly) — skips loading
 # the orchestrator entirely, so every instruction falls through the existing
 # `if not AI_STACK_AVAILABLE` branch in execute_instruction() below and goes straight to
@@ -60,10 +54,9 @@ else:
     print("[Physyk] Non-agentic mode (PHYSYK_AGENTIC=0) — instructions dispatch directly "
           "to Isaac Sim, no Nemotron orchestrator.")
 
-ISAAC_SIM_URL = "http://localhost:8100"
-NEMOTRON_URL = "http://localhost:8000"
-COSMOS_URL = "http://localhost:8001"
-GROOT_SERVER_URL = "http://localhost:8300"
+import physyk_config as cfg
+
+ISAAC_SIM_URL = cfg.ISAAC_SIM_URL
 
 app = FastAPI(title="Physyk Franka Panda AI Control")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -73,8 +66,54 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # only 7860/8211 are actually forwarded through Brev/VS Code (see BREV_PORT_CONFIG.md) — a
 # separate port would work over plain localhost but 404/fail to connect for anyone reaching
 # this dashboard remotely, which is exactly what happened with the first version of this.
-from reasoning_dashboard import mount_reasoning_routes
+from reasoning_dashboard import mount_reasoning_routes, custom_pages
 mount_reasoning_routes(app)
+
+
+def _render_perception_log_page() -> str:
+    """/reasoning/perception — what the overview camera detected, with the annotated frame
+    (bounding boxes + estimated XYZ) for every pre-pick detection and post-place check. The
+    data lives in the Isaac Sim process; images are proxied via /perception_log/<id>.jpg."""
+    import html as _html
+    try:
+        req = urllib.request.Request(f"{ISAAC_SIM_URL}/perception/log", headers={"User-Agent": "Physyk-Bridge"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            entries = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return f"<h1 style='font-family:monospace;color:#f87171'>Isaac Sim unreachable: {_html.escape(str(e))}</h1>"
+    rows = []
+    for e in entries:
+        lines = []
+        for key, o in (e.get("objects") or {}).items():
+            name = key.replace("_", " ").title()
+            if o.get("seen"):
+                x, y, z = o["camera_xyz_m"]
+                lines.append(f"{name}: seen at ({x:.3f}, {y:.3f}, {z:.3f}) m"
+                             + (f", yaw {o['yaw_deg']}°" if o.get("yaw_deg") is not None else "")
+                             + (f" — scoring error vs sim {o['score_error_mm']} mm" if o.get("score_error_mm") is not None else ""))
+            else:
+                lines.append(f"{name}: NOT SEEN")
+        rows.append(f"""<div class="entry">
+          <div class="meta"><span class="t">{e['t']}</span> <span class="label">{_html.escape(e['event'])}</span></div>
+          <div class="text">{_html.escape(e.get('note',''))}\n{_html.escape(chr(10).join(lines))}</div>
+          <img class="frame" src="/perception_log/{e['id']}.jpg">
+        </div>""")
+    body = "".join(rows) or '<div class="empty">No perception events yet — switch on the perception toggle and run a pick-and-place.</div>'
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="5">
+<title>Perception — Log</title><style>
+ body {{ background:radial-gradient(1000px 600px at 8% -10%, rgba(110,140,205,0.12), transparent 62%), #0a0c10; color:#e5e8ef;
+        font-family:'Inter',-apple-system,'Segoe UI',Roboto,sans-serif; margin:0; padding:28px 32px; min-height:100vh; }}
+ h1 {{ color:#eef1f7; font-size:1.05rem; font-weight:600; margin:0 0 18px; letter-spacing:0.2px; padding-bottom:12px; border-bottom:1px solid #232a38; }}
+ .entry {{ border-left:2px solid #8ea3cf; background:rgba(22,27,36,0.7); border-top:1px solid #1c222e; border-right:1px solid #1c222e;
+          border-bottom:1px solid #1c222e; padding:12px 16px; margin-bottom:12px; border-radius:0 8px 8px 0; }}
+ .meta {{ font-size:0.72rem; color:#7e879a; margin-bottom:5px; }} .label {{ font-weight:600; color:#8ea3cf; }}
+ .text {{ font-family:'JetBrains Mono',ui-monospace,monospace; font-size:0.8rem; line-height:1.55; white-space:pre-wrap; color:#d0d5e0; }}
+ .empty {{ color:#59626f; }}
+ .frame {{ display:block; margin-top:10px; max-width:100%; width:720px; border-radius:6px; border:1px solid #232a38; }}
+</style></head><body><h1>Perception — camera detections (overview camera, color segmentation + depth)</h1>{body}</body></html>"""
+
+
+custom_pages["perception"] = _render_perception_log_page
 
 connected_ws: list = []
 broadcast_lock = threading.Lock()
@@ -99,18 +138,7 @@ sim_state = {
     # last grounding call's stage-vs-vision delta per object. Purely informational: nothing
     # in sim_state or the dispatch path reads this to make a decision.
     "perception": None,
-    # Real GR00T VLA per-chunk summary (isaac_sim_service.py's own vla_reasoning field) —
-    # None unless a "vla:"-prefixed task has actually run at least one chunk through the
-    # model. Not narration: a real summary of the model's own predicted action_chunk tensor.
-    "vla_reasoning": None,
-    # Structured chunk counter alongside vla_reasoning — was declared here but never
-    # actually forwarded from Isaac Sim's /state in the poll loop below, so this field was
-    # silently stuck at Python's implicit None (missing key) forever regardless of what
-    # Isaac Sim reported. Chunk progress was still visible via vla_reasoning's own text and
-    # via `stage`, so nothing downstream broke, but any future UI wanting the structured
-    # count (e.g. a progress bar) was reading a permanently-null field. Fixed alongside.
-    "vla_chunks_done": None,
-    # Live online/offline status for all 4 backing services, independent of whether the
+    # Live online/offline status for the 3 backing services, independent of whether the
     # "Send to Agent" toggle is on — the toggle only changes dispatch ROUTING (see
     # /agent_toggle's own docstring), it never starts or stops anything, so this panel is
     # meant to reflect real process health regardless of that toggle's position.
@@ -118,7 +146,6 @@ sim_state = {
         "isaac_sim": False,
         "nemotron": False,
         "cosmos": False,
-        "groot": False,
     },
 }
 
@@ -164,8 +191,6 @@ def poll_isaac_sim_state():
                     sim_state["busy"] = data.get("busy", False)
                     sim_state["last_instruction"] = data.get("last_instruction", sim_state["last_instruction"])
                     sim_state["fps"] = data.get("fps", 60.0)
-                    sim_state["vla_reasoning"] = data.get("vla_reasoning")
-                    sim_state["vla_chunks_done"] = data.get("vla_chunks_done")
                     sim_state["isaac_connected"] = True
         except Exception:
             sim_state["isaac_connected"] = False
@@ -189,9 +214,12 @@ def poll_isaac_sim_state():
 state_sync_thread = threading.Thread(target=poll_isaac_sim_state, daemon=True)
 state_sync_thread.start()
 
-def _url_is_healthy(url: str, timeout: float = 1.5) -> bool:
+def _url_is_healthy(url: str, timeout: float = 5.0, api_key: str = "") -> bool:
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Physyk-Bridge"})
+        headers = {"User-Agent": "Physyk-Bridge"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:
@@ -205,18 +233,38 @@ def poll_service_status():
     indicators for a dashboard, not something anything else in the app reads to make a
     decision, so there's no reason to poll them at telemetry speed."""
     while True:
-        sim_state["service_status"]["isaac_sim"] = sim_state["isaac_connected"]
-        sim_state["service_status"]["nemotron"] = _url_is_healthy(f"{NEMOTRON_URL}/health")
-        sim_state["service_status"]["cosmos"] = _url_is_healthy(f"{COSMOS_URL}/v1/models")
-        sim_state["service_status"]["groot"] = _url_is_healthy(f"{GROOT_SERVER_URL}/health")
-        time.sleep(5.0)
+        # Hosted NVIDIA API (or a local OpenAI-compatible server): "online" = the /models
+        # listing answers with our key. Slow poll — every call is a real network round trip.
+        sim_state["service_status"]["nemotron"] = _url_is_healthy(f"{cfg.NEMOTRON_BASE_URL}/models", api_key=cfg.NEMOTRON_API_KEY)
+        sim_state["service_status"]["cosmos"] = _url_is_healthy(f"{cfg.COSMOS_BASE_URL}/models", api_key=cfg.COSMOS_API_KEY)
+        time.sleep(30.0)
+
+SIM_CONTAINER_NAME = os.environ.get("PHYSYK_SIM_CONTAINER", "physyk-isaac-sim")
+
+def _sim_container_running() -> bool:
+    """True if the Isaac Sim docker container (start_sim_docker.sh) is running — it counts as ONLINE even while the
+    sim inside is still loading and port 8100 does not answer yet."""
+    try:
+        out = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", SIM_CONTAINER_NAME],
+                             capture_output=True, text=True, timeout=3)
+        return out.returncode == 0 and out.stdout.strip() == "true"
+    except Exception:
+        return False
+
+def poll_isaac_status():
+    """Isaac Sim pill: ONLINE if its docker container is running OR its API answers (a windowed/native run)."""
+    while True:
+        sim_state["service_status"]["isaac_sim"] = bool(sim_state["isaac_connected"]) or _sim_container_running()
+        time.sleep(3.0)
+
+threading.Thread(target=poll_isaac_status, daemon=True).start()
 
 service_status_thread = threading.Thread(target=poll_service_status, daemon=True)
 service_status_thread.start()
 
 def _forward_direct_to_isaac(instruction: str):
     """Fire-and-forget single instruction straight to Isaac Sim's /execute — the original
-    dispatch path, kept as-is for plain control commands (reset/home/randomize/vla:) that
+    dispatch path, kept as-is for plain control commands (reset/home/randomize) that
     don't need LLM reasoning and that Isaac Sim's own loop already keyword-detects reliably."""
     try:
         req = urllib.request.Request(
@@ -262,8 +310,6 @@ _CONTROL_KEYWORDS = ("reset", "home", "park", "retract", "randomize", "shuffle")
 
 def _is_control_command(instruction: str) -> bool:
     inst = instruction.strip().lower()
-    if inst.startswith("vla:") or inst.startswith("vla "):
-        return True
     return any(inst == kw or inst.startswith(kw + " ") or inst == f"go {kw}" for kw in _CONTROL_KEYWORDS)
 
 def _on_plan_update(plan: dict):
@@ -319,7 +365,8 @@ async def proxy_mjpeg_stream(stream_path: str):
                         yield chunk
             except Exception:
                 img = np.zeros((720, 1280, 3), dtype=np.uint8)
-                cv2.putText(img, "ISAAC SIM 6.0.1 - CONNECTING TO GPU RENDERER...", (40, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 2, cv2.LINE_AA)
+                img[:] = (46, 11, 5)                                  # deep navy (BGR), same as the page background
+                cv2.putText(img, "CONNECTING TO ISAAC SIM...", (40, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (247, 230, 223), 1, cv2.LINE_AA)
                 _, encoded = cv2.imencode(".jpg", img)
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + encoded.tobytes() + b'\r\n')
@@ -332,18 +379,6 @@ async def proxy_scene_stream():
 @app.get("/camera/scene.stream")
 async def proxy_scene_stream_alias():
     return await proxy_mjpeg_stream("/camera/stream")
-
-@app.get("/camera/front.stream")
-async def proxy_front_stream():
-    return await proxy_mjpeg_stream("/camera/front.stream")
-
-@app.get("/camera/side.stream")
-async def proxy_side_stream():
-    return await proxy_mjpeg_stream("/camera/side.stream")
-
-@app.get("/camera/top.stream")
-async def proxy_top_stream():
-    return await proxy_mjpeg_stream("/camera/top.stream")
 
 @app.get("/camera/wrist.stream")
 async def proxy_wrist_stream():
@@ -363,9 +398,6 @@ def get_cameras_api():
     return {
         "cameras": [
             {"id": "scene", "name": "3rd Person Isometric Overview", "stream": "/camera/stream"},
-            {"id": "front", "name": "Front Operator View", "stream": "/camera/front.stream"},
-            {"id": "side", "name": "Side Profile & Height Clearance", "stream": "/camera/side.stream"},
-            {"id": "top", "name": "Top-Down Bird's Eye Planar", "stream": "/camera/top.stream"},
             {"id": "wrist", "name": "Wrist Camera (Gripper Close-up)", "stream": "/camera/wrist.stream"},
         ]
     }
@@ -427,7 +459,7 @@ def hard_reset():
          if a multi-step plan is mid-flight — via request_stop(), checked at every
          poll/loop boundary so it bails out within one poll interval instead of running a
          subgoal, a retry, or a Nemotron replan call to completion first.
-      2. Isaac Sim's own physics loop, which may be mid-motion on a pick_place or VLA task
+      2. Isaac Sim's own physics loop, which may be mid-motion on a pick_place task
          dispatched either by the orchestrator or directly — via isaac_sim_service.py's own
          /hard_stop, which drops whatever's active, homes the arm, and resets every cube."""
     push_log("HARD RESET — stopping any active plan/task, homing the arm, and resetting cubes...", "WARN")
@@ -478,6 +510,37 @@ def proxy_randomize():
         push_log(f"Randomize request failed: {e}", "WARN")
         return {"status": "error", "message": str(e)}
 
+@app.get("/perception_log/{entry_id}.jpg")
+def perception_log_image(entry_id: int):
+    try:
+        req = urllib.request.Request(f"{ISAAC_SIM_URL}/perception/log/{entry_id}.jpg", headers={"User-Agent": "Physyk-Bridge"})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            return Response(content=resp.read(), media_type="image/jpeg")
+    except Exception:
+        return Response(status_code=404)
+
+@app.post("/perception_mode")
+async def perception_mode(req: Request):
+    """The "Drive arm from camera" switch: flips Isaac Sim's perception provider between
+    'shadow' (deterministic — simulator ground-truth poses drive the arm) and 'vision'
+    (pure perception: camera-derived poses only, no simulator coordinates, no fallback). Live,
+    no restart; takes effect on the next dispatched pick/place."""
+    body = await req.json()
+    mode = "pure" if body.get("vision") else "shadow"
+    try:
+        preq = urllib.request.Request(
+            f"{ISAAC_SIM_URL}/perception/mode",
+            data=json.dumps({"mode": mode}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(preq, timeout=5.0) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        push_log(f"Perception switch: arm is now driven by "
+                 f"{'CAMERA ONLY (pure perception — no simulator coordinates)' if mode == 'pure' else 'simulator ground truth (deterministic)'}.", "INFO")
+        return {"status": "ok", "mode": result.get("mode", mode)}
+    except Exception as e:
+        push_log(f"Could not switch perception mode: {e}", "WARN")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=502)
+
 @app.post("/agent_toggle")
 async def agent_toggle(req: Request):
     """The "Send to Agent" switch — a live, in-browser toggle distinct from the AGENTIC_MODE
@@ -516,32 +579,32 @@ HTML = """<!DOCTYPE html>
     --card-2: #1a2029;
     --border: #232a38;
     --border-soft: #1c222e;
-    --accent: #5b9bff;
-    --accent-glow: rgba(91, 155, 255, 0.22);
-    --accent2: #8b5cf6;
-    --cyan: #22d3ee;
-    --green: #22c55e;
-    --amber: #f59e0b;
-    --red: #ef4444;
+    --accent: #8ea3cf;
+    --accent-glow: rgba(142, 163, 207, 0.10);
+    --accent2: #a9b8d6;
+    --cyan: #86a5c8;
+    --green: #7fb4c9;
+    --amber: #b3a98f;
+    --red: #b88a93;
     --text: #eef1f7;
     --muted: #7e879a;
     --muted-2: #59626f;
-    --r: 14px;
-    --r-sm: 10px;
+    --r: 12px;
+    --r-sm: 9px;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html { scrollbar-color: #2a3142 transparent; }
   body {
     background:
-      radial-gradient(1200px 700px at 12% -10%, rgba(91,155,255,0.08), transparent 60%),
-      radial-gradient(900px 600px at 100% 0%, rgba(139,92,246,0.06), transparent 55%),
+      radial-gradient(1200px 700px at 12% -10%, rgba(142,163,207,0.08), transparent 60%),
+      radial-gradient(900px 600px at 100% 0%, rgba(169,184,214,0.06), transparent 55%),
       var(--bg);
     color: var(--text); font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     min-height: 100vh; overflow-x: hidden;
   }
   ::-webkit-scrollbar { width: 9px; height: 9px; }
   ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: #262e3d; border-radius: 999px; }
+  ::-webkit-scrollbar-thumb { background: #2a3142; border-radius: 999px; }
   ::-webkit-scrollbar-thumb:hover { background: #333d50; }
   .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
   .display { font-family: 'Sora', 'Inter', sans-serif; }
@@ -559,7 +622,7 @@ HTML = """<!DOCTYPE html>
   }
   .logo { display: flex; align-items: center; gap: 13px; }
   .logo-icon {
-    width: 38px; height: 38px; background: linear-gradient(135deg,#5b9bff,#8b5cf6); border-radius: 11px;
+    width: 38px; height: 38px; background: linear-gradient(135deg,#8ea3cf,#a9b8d6); border-radius: 11px;
     display: flex; align-items: center; justify-content: center; font-size: 19px;
     box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset, 0 4px 16px var(--accent-glow);
   }
@@ -572,17 +635,17 @@ HTML = """<!DOCTYPE html>
     background: var(--card); border: 1px solid var(--border); border-radius: 999px;
     font-size: 0.76rem; font-weight: 600;
   }
-  .status-pill.feature { color: var(--cyan); border-color: rgba(34,211,238,0.28); background: rgba(34,211,238,0.08); }
-  .status-pill.feature .pill-icon { filter: drop-shadow(0 0 4px rgba(34,211,238,0.6)); }
-  .status-pill.mode-agentic { color: var(--accent2); border-color: rgba(139,92,246,0.28); background: rgba(139,92,246,0.08); }
-  .status-pill.mode-direct { color: var(--amber); border-color: rgba(245,158,11,0.28); background: rgba(245,158,11,0.08); }
-  .status-pill.mode-shadow, .status-pill.mode-stage { color: var(--cyan); border-color: rgba(34,211,238,0.28); background: rgba(34,211,238,0.08); }
-  .status-pill.mode-vision { color: var(--green); border-color: rgba(74,222,128,0.28); background: rgba(74,222,128,0.08); }
+  .status-pill.feature { color: var(--cyan); border-color: rgba(134,165,200,0.28); background: rgba(134,165,200,0.08); }
+  .status-pill.feature .pill-icon { filter: drop-shadow(0 0 4px rgba(134,165,200,0.6)); }
+  .status-pill.mode-agentic { color: var(--accent2); border-color: rgba(169,184,214,0.28); background: rgba(169,184,214,0.08); }
+  .status-pill.mode-direct { color: var(--amber); border-color: rgba(179,169,143,0.28); background: rgba(179,169,143,0.08); }
+  .status-pill.mode-shadow, .status-pill.mode-stage { color: var(--cyan); border-color: rgba(134,165,200,0.28); background: rgba(134,165,200,0.08); }
+  .status-pill.mode-vision, .status-pill.mode-pure { color: var(--green); border-color: rgba(127,180,201,0.28); background: rgba(127,180,201,0.08); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 2s infinite; }
   .dot.busy { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 0.6s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-  /* 4-service status strip — real process health for Isaac Sim / Nemotron / Cosmos / GR00T,
+  /* 4-service status strip — real process health for Isaac Sim / Nemotron / Cosmos,
      independent of the agent toggle (a service can be ONLINE while the toggle routes
      around it). See poll_service_status() in the Python backend. */
   .svc-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -592,9 +655,9 @@ HTML = """<!DOCTYPE html>
     font-size: 0.72rem; font-weight: 600;
   }
   .svc-pill .svc-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-  .svc-pill.svc-online { color: var(--green); border-color: rgba(74,222,128,0.28); background: rgba(74,222,128,0.08); }
+  .svc-pill.svc-online { color: var(--green); border-color: rgba(127,180,201,0.28); background: rgba(127,180,201,0.08); }
   .svc-pill.svc-online .svc-dot { background: var(--green); box-shadow: 0 0 6px var(--green); }
-  .svc-pill.svc-offline { color: var(--muted); border-color: var(--border); background: rgba(148,163,184,0.06); }
+  .svc-pill.svc-offline { color: var(--muted); border-color: var(--border); background: rgba(126,135,154,0.06); }
   .svc-pill.svc-offline .svc-dot { background: var(--muted); box-shadow: none; }
   .svc-pill .svc-state { opacity: 0.75; font-weight: 500; font-size: 0.68rem; }
 
@@ -615,11 +678,11 @@ HTML = """<!DOCTYPE html>
   }
   .viewport-title { font-size: 0.81rem; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .vp-select {
-    background: var(--card-2); color: #dfe4ee; border: 1px solid var(--border); border-radius: 7px;
+    background: var(--card-2); color: #a9b8d6; border: 1px solid var(--border); border-radius: 7px;
     padding: 5px 9px; font-size: 0.74rem; outline: none; cursor: pointer; font-weight: 600; font-family: inherit;
   }
   .vp-select:hover { border-color: #333d50; }
-  .vp-badge { font-size: 0.68rem; padding: 3px 10px; border-radius: 999px; background: rgba(91,155,255,0.14); color: var(--accent); border: 1px solid rgba(91,155,255,0.28); font-weight: 700; }
+  .vp-badge { font-size: 0.68rem; padding: 3px 10px; border-radius: 999px; background: rgba(142,163,207,0.14); color: var(--accent); border: 1px solid rgba(142,163,207,0.28); font-weight: 700; }
   .fps-readout { font-size: 0.74rem; color: var(--muted); font-weight: 600; }
   .fps-readout .live-tag { color: var(--green); font-size: 0.62rem; font-weight: 800; letter-spacing: 0.4px; margin-right: 5px; }
 
@@ -646,13 +709,13 @@ HTML = """<!DOCTYPE html>
     background: var(--card); border: 1px solid var(--border); border-radius: var(--r-sm);
     padding: 13px 14px; transition: border-color 0.2s, transform 0.2s;
   }
-  .telem-card:hover { border-color: #2d3648; transform: translateY(-1px); }
+  .telem-card:hover { border-color: #333d50; transform: translateY(-1px); }
   .telem-label {
     font-size: 0.62rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.9px; font-weight: 700;
     margin-bottom: 7px; display: flex; align-items: center; justify-content: space-between; gap: 6px;
   }
   .telem-tag { font-size: 0.56rem; padding: 1px 6px; border-radius: 999px; font-weight: 800; letter-spacing: 0.3px; }
-  .telem-tag.live { background: rgba(34,197,94,0.14); color: var(--green); }
+  .telem-tag.live { background: rgba(127,180,201,0.14); color: var(--green); }
   .telem-tag.cfg { background: rgba(126,135,154,0.16); color: var(--muted); }
   .telem-val { font-size: 1.08rem; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--text); }
   .telem-unit { font-size: 0.68rem; color: var(--muted); margin-left: 3px; font-weight: 500; }
@@ -709,7 +772,7 @@ HTML = """<!DOCTYPE html>
     position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
     background: var(--muted); transition: transform 0.2s ease, background 0.2s ease;
   }
-  .switch input:checked + .switch-track { background: rgba(139,92,246,0.22); border-color: var(--accent2); }
+  .switch input:checked + .switch-track { background: rgba(169,184,214,0.22); border-color: var(--accent2); }
   .switch input:checked + .switch-track .switch-thumb { transform: translateX(18px); background: var(--accent2); }
   .agent-switch-label { font-size: 0.78rem; font-weight: 600; color: var(--muted); }
   .agent-switch-row.on .agent-switch-label { color: var(--text); }
@@ -717,13 +780,13 @@ HTML = """<!DOCTYPE html>
     flex: 1; padding: 11px 16px; border: none; border-radius: 9px; cursor: pointer;
     font-size: 0.83rem; font-weight: 700; font-family: inherit; transition: all 0.15s ease;
   }
-  .btn-primary { background: linear-gradient(135deg,#5b9bff,#8b5cf6); color: #fff; box-shadow: 0 4px 14px var(--accent-glow); }
-  .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 22px rgba(91,155,255,0.38); }
+  .btn-primary { background: linear-gradient(135deg,#8ea3cf,#a9b8d6); color: #fff; box-shadow: 0 4px 14px var(--accent-glow); }
+  .btn-primary:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 22px rgba(142,163,207,0.38); }
   .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
   .btn-secondary { background: var(--card-2); border: 1px solid var(--border); color: var(--text); }
   .btn-secondary:hover { background: #232b39; border-color: #333d50; }
-  .btn-danger { background: linear-gradient(135deg,#ef4444,#b91c1c); color: #fff; box-shadow: 0 4px 14px rgba(239,68,68,0.35); }
-  .btn-danger:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 22px rgba(239,68,68,0.5); }
+  .btn-danger { background: linear-gradient(135deg,#a97480,#7d4f58); color: #fff; box-shadow: 0 4px 14px rgba(169,116,128,0.35); }
+  .btn-danger:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 7px 22px rgba(169,116,128,0.5); }
   .btn-danger:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
 
   /* ── QUICK TASKS ── */
@@ -734,7 +797,7 @@ HTML = """<!DOCTYPE html>
     padding: 10px 14px; font-size: 0.79rem; cursor: pointer; display: flex; align-items: center; gap: 10px;
     transition: all 0.15s ease; font-weight: 500;
   }
-  .cmd-card:hover { border-color: var(--accent); background: rgba(91,155,255,0.07); transform: translateX(2px); }
+  .cmd-card:hover { border-color: var(--accent); background: rgba(142,163,207,0.07); transform: translateX(2px); }
   .cmd-swatch { width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0; }
 
   /* ── API DIRECTORY ── */
@@ -755,9 +818,9 @@ HTML = """<!DOCTYPE html>
   .log-entry { display: flex; gap: 8px; line-height: 1.45; }
   .log-time { color: var(--muted-2); flex-shrink: 0; }
   .log-msg { color: #c6ccd8; word-break: break-word; }
-  .log-msg.SUCCESS { color: #4ade80; }
-  .log-msg.WARN { color: #fbbf24; }
-  .log-msg.ERROR { color: #f87171; }
+  .log-msg.SUCCESS { color: #7fb4c9; }
+  .log-msg.WARN { color: #b3a98f; }
+  .log-msg.ERROR { color: #b88a93; }
 
   /* ── AGENT PLAN (Phase 5 — real Nemotron decompose/guardrail/retry/replan state) ── */
   .plan-panel { padding: 18px 20px; border-bottom: 1px solid var(--border-soft); }
@@ -792,13 +855,13 @@ HTML = """<!DOCTYPE html>
   .plan-step.PENDING { opacity: 0.55; }
   .badge-PENDING, .plan-status-PLANNING { background: rgba(126,135,154,0.16); color: var(--muted); }
   .plan-step.RUNNING { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-glow); }
-  .badge-RUNNING, .plan-status-PLANNING.active, .plan-status-RUNNING { background: rgba(91,155,255,0.16); color: var(--accent); }
-  .plan-step.RETRYING, .plan-step.REPLANNING { border-color: #fbbf24; }
-  .badge-RETRYING, .badge-REPLANNING, .plan-status-PARTIAL, .plan-status-VERIFYING { background: rgba(251,191,36,0.16); color: #fbbf24; }
-  .plan-step.DONE { border-color: rgba(74,222,128,0.4); }
-  .badge-DONE, .plan-status-SUCCESS { background: rgba(74,222,128,0.16); color: #4ade80; }
-  .plan-step.FAILED, .plan-step.REJECTED { border-color: rgba(248,113,113,0.4); }
-  .badge-FAILED, .badge-REJECTED, .plan-status-FAILED, .plan-status-REJECTED, .plan-status-GOAL_NOT_HELD { background: rgba(248,113,113,0.16); color: #f87171; }
+  .badge-RUNNING, .plan-status-PLANNING.active, .plan-status-RUNNING { background: rgba(142,163,207,0.16); color: var(--accent); }
+  .plan-step.RETRYING, .plan-step.REPLANNING { border-color: #b3a98f; }
+  .badge-RETRYING, .badge-REPLANNING, .plan-status-PARTIAL, .plan-status-VERIFYING { background: rgba(179,169,143,0.16); color: #b3a98f; }
+  .plan-step.DONE { border-color: rgba(127,180,201,0.4); }
+  .badge-DONE, .plan-status-SUCCESS { background: rgba(127,180,201,0.16); color: #7fb4c9; }
+  .plan-step.FAILED, .plan-step.REJECTED { border-color: rgba(184,138,147,0.4); }
+  .badge-FAILED, .badge-REJECTED, .plan-status-FAILED, .plan-status-REJECTED, .plan-status-GOAL_NOT_HELD { background: rgba(184,138,147,0.16); color: #b88a93; }
   .plan-step.ABORTED { opacity: 0.4; }
   .badge-ABORTED { background: rgba(126,135,154,0.16); color: var(--muted); }
   @keyframes plan-pulse { 0%,100% { box-shadow: 0 0 0 1px var(--accent-glow); } 50% { box-shadow: 0 0 0 4px var(--accent-glow); } }
@@ -813,40 +876,106 @@ HTML = """<!DOCTYPE html>
     font-size: 0.64rem; color: var(--muted); font-weight: 600; padding: 3px 9px;
     background: var(--card); border: 1px solid var(--border-soft); border-radius: 999px;
   }
+
+  /* ── Theme layer: the dark neutral base of the original UI, muted steel-blue accents, no glows ── */
+  body {
+    background: radial-gradient(1100px 650px at 10% -12%, rgba(110,140,205,0.07), transparent 60%), var(--bg);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  }
+  header { background: rgba(13,16,22,0.94); border-bottom: 1px solid var(--border-soft); }
+  .logo-text h1 { font-family: 'Inter', sans-serif; font-weight: 600; font-size: 1.05rem; letter-spacing: 0.2px; }
+  .status-pill, .svc-pill { background: var(--card); border-color: var(--border); color: var(--text); font-weight: 500; }
+  .status-pill.feature, .status-pill.mode-agentic, .status-pill.mode-direct, .status-pill.mode-shadow, .status-pill.mode-stage,
+  .status-pill.mode-vision, .status-pill.mode-pure { color: var(--accent); border-color: var(--border); background: rgba(142,163,207,0.07); }
+  .status-pill.feature .pill-icon { filter: none; }
+  .svc-pill.svc-online { color: var(--text); border-color: rgba(127,180,201,0.30); background: rgba(127,180,201,0.07); }
+  .svc-pill.svc-online .svc-dot, .dot, .dot.busy { box-shadow: none; }
+  .svc-pill.svc-offline { color: var(--muted); }
+  .dot { background: var(--green); }
+  .dot.busy { background: var(--accent); }
+  .btn { border-radius: 8px; font-weight: 600; letter-spacing: 0.2px; }
+  .btn-primary { background: #3f5b8f; color: #fff; box-shadow: none; }
+  .btn-primary:hover:not(:disabled) { background: #4a6aa3; transform: none; box-shadow: none; }
+  .btn-secondary { background: var(--card-2); border: 1px solid var(--border); color: var(--text); }
+  .btn-secondary:hover { background: #232b39; border-color: #333d50; }
+  .btn-danger { background: transparent; color: #b88a93; border: 1px solid rgba(184,138,147,0.45); box-shadow: none; }
+  .btn-danger:hover:not(:disabled) { background: rgba(184,138,147,0.10); transform: none; box-shadow: none; }
+  .telem-gauge-fill, .joint-bar-fill { background: linear-gradient(90deg, #4c67a0, #9db1d9); }
+  .telem-gauge-bg, .joint-bar-bg { background: #1c222e; }
+  .switch input:checked + .switch-track { background: rgba(142,163,207,0.20); border-color: var(--accent); }
+  .switch input:checked + .switch-track .switch-thumb { background: var(--accent); }
+  .cmd-swatch { background: var(--muted-2) !important; }
+  .cmd-card { border-color: var(--border) !important; }
+  .cmd-card:hover { border-color: var(--accent) !important; background: rgba(142,163,207,0.07); transform: none; }
+  .viewport-card, .telem-card, .joints-card { box-shadow: none; }
+  .viewport-card { box-shadow: 0 10px 30px rgba(0,0,0,0.40); }
+  .telem-card:hover { transform: none; }
+  .stage-overlay { box-shadow: none; }
+  .stage-overlay, .stage-overlay.idle { color: var(--text); }
+  .stage-dot, .stage-overlay.idle .stage-dot { background: var(--accent); }
+  .vp-badge { background: rgba(142,163,207,0.10); border-color: rgba(142,163,207,0.28); color: var(--accent); }
+  .plan-step.RUNNING, .plan-step.REPLANNING { animation: none; box-shadow: 0 0 0 1px rgba(142,163,207,0.35); }
+  .live-tag { display: inline-flex; align-items: center; gap: 6px; color: var(--green); }
+  .live-dot, .feed-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); margin-right: 6px; vertical-align: 1px; }
+  .live-tag .live-dot { margin-right: 0; }
+  .feed-dot.off { background: var(--red); }
+  .stack-chip { color: var(--muted); background: var(--card); border-color: var(--border-soft); font-weight: 500; }
+  footer { background: var(--surface); border-top-color: var(--border-soft); }
+  ::-webkit-scrollbar-thumb { background: #262e3d; }
+  html { scrollbar-color: #262e3d transparent; }
+
+  /* ── Header: brand, then the small pills right next to it (grouped, labelled, uniform) ── */
+  header { min-height: 64px; flex-wrap: wrap; justify-content: flex-start; gap: 10px 40px; padding: 10px 26px; }
+  .logo { gap: 18px; }
+  .logo-ntt { height: 27px; width: auto; display: block; }
+  .logo-sep { width: 1px; height: 32px; background: var(--border); display: block; }
+  .logo-text p.tagline { font-size: 0.72rem; color: var(--muted); margin-top: 3px; letter-spacing: 0.15px; white-space: nowrap; }
+  .header-right { display: flex; align-items: center; justify-content: flex-start; flex-wrap: wrap; gap: 8px 16px; }
+  .hgroup { display: flex; align-items: center; gap: 6px; }
+  .hlabel { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 1px; font-weight: 600; color: var(--muted-2); margin-right: 2px; }
+  .hdivider { width: 1px; height: 22px; background: var(--border); }
+  header .status-pill, header .svc-pill { height: 26px; padding: 0 11px; gap: 7px; font-size: 0.7rem; font-weight: 500; border-radius: 999px; white-space: nowrap; letter-spacing: 0.1px; }
+  header .pill-icon { display: none; }
+  header .svc-pill .svc-state { display: none; }
+  header .svc-pill.svc-offline .svc-dot { background: #7a5f68; }
+  header .hlink { color: var(--muted); text-decoration: none; cursor: pointer; transition: color 0.15s, border-color 0.15s; }
+  header .hlink:hover { color: var(--text); border-color: #333d50; }
+  header .dot { width: 7px; height: 7px; flex-shrink: 0; }
 </style>
 </head>
 <body>
 
 <header>
   <div class="logo">
-    <div class="logo-icon">
-      <svg class="icon-lg" viewBox="0 0 24 24"><path d="M4 20h4l2-7-3-6"/><circle cx="7" cy="6" r="1.6"/><path d="M10 13l6-2 3 3-2 6h-4"/><circle cx="19" cy="12" r="1.4"/></svg>
-    </div>
+    <img class="logo-ntt" src="ntt_data_logo.png" alt="NTT DATA">
+    <span class="logo-sep"></span>
     <div class="logo-text">
       <h1>Physyk AI</h1>
-      <p>NVIDIA Isaac Sim 6.0.1 • RTX PRO 6000 Blackwell (96 GB) • Franka Panda 7-DOF</p>
+      <p class="tagline">__STACK_LINE__</p>
     </div>
   </div>
-  <div class="header-badges">
-    <div class="status-pill feature"><span class="pill-icon"><svg class="icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M14.5 9.5l-2 5-3-1 2-5z"/></svg></span><span>RMPFlow · Collision-Aware</span></div>
-    <div class="status-pill" id="modePill" title="Whether instructions go through the Nemotron agentic orchestrator (decompose/guardrail/verify/retry) or straight to Isaac Sim as typed.">
-      <span class="pill-icon" id="modePillIcon"></span><span id="modePillText">—</span>
+  <div class="header-right">
+    <div class="hgroup">
+      <span class="hlabel">Mode</span>
+      <div class="status-pill" id="rmpPill" title="Arm motion: NVIDIA RMPFlow with the PickPlaceController"><span>RMPFlow</span></div>
+      <div class="status-pill" id="modePill" title="Whether instructions go through the Nemotron agentic orchestrator (decompose / guardrail / verify / retry) or straight to Isaac Sim as typed."><span class="pill-icon" id="modePillIcon"></span><span id="modePillText">Agentic</span></div>
+      <div class="status-pill" id="perceptionPill" title="Where object positions come from: the overview camera only (colour segmentation + depth), or the simulator's own poses."><span class="pill-icon"></span><span id="perceptionPillText">Perception</span></div>
+      <div class="status-pill"><div class="dot" id="statusDot"></div><span id="statusText">Sim idle</span></div>
     </div>
-    <div class="status-pill" id="perceptionPill" title="Cosmos-Reason2-2B vision perception mode. Stage/shadow: ground-truth pose drives the robot, Cosmos runs alongside and only logs a delta. Vision: Cosmos's own estimate drives the robot (with automatic fallback to ground truth on failure).">
-      <span class="pill-icon"><svg class="icon-sm" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg></span><span id="perceptionPillText">PERCEPTION —</span>
+    <span class="hdivider"></span>
+    <div class="hgroup svc-strip" title="Real process health of the three backing services. Offline means the service is not running at all, which is separate from the 'Send prompt to Agent' toggle.">
+      <span class="hlabel">Services</span>
+      <div class="svc-pill svc-offline" id="svc-isaac_sim"><span class="svc-dot"></span><span class="svc-label">Isaac Sim</span><span class="svc-state">—</span></div>
+      <div class="svc-pill svc-offline" id="svc-nemotron"><span class="svc-dot"></span><span class="svc-label">Nemotron</span><span class="svc-state">—</span></div>
+      <div class="svc-pill svc-offline" id="svc-cosmos"><span class="svc-dot"></span><span class="svc-label">Cosmos</span><span class="svc-state">—</span></div>
     </div>
-    <div class="status-pill">
-      <div class="dot" id="statusDot"></div>
-      <span id="statusText">ISAAC SIM ONLINE</span>
+    <span class="hdivider"></span>
+    <div class="hgroup">
+      <span class="hlabel">Logs</span>
+      <a href="/reasoning/nemotron" target="_blank" class="status-pill hlink" title="Full Nemotron reasoning log">Nemotron</a>
+      <a href="/reasoning/cosmos" target="_blank" class="status-pill hlink" title="Full Cosmos log, with the camera frames it was shown">Cosmos</a>
+      <a href="/reasoning/perception" target="_blank" class="status-pill hlink" title="Camera detections: annotated frames, bounding boxes and estimated XYZ for every pre-pick detection and post-place check">Perception</a>
     </div>
-  </div>
-  <div class="svc-strip" title="Real process health for all 4 backing services. A service being OFFLINE here means it isn't running at all — separate from the 'Send to Agent' toggle above, which only changes routing and never stops anything.">
-    <div class="svc-pill svc-offline" id="svc-isaac_sim"><span class="svc-dot"></span><span class="svc-label">Isaac Sim</span><span class="svc-state">—</span></div>
-    <div class="svc-pill svc-offline" id="svc-nemotron"><span class="svc-dot"></span><span class="svc-label">Nemotron</span><span class="svc-state">—</span></div>
-    <div class="svc-pill svc-offline" id="svc-cosmos"><span class="svc-dot"></span><span class="svc-label">Cosmos</span><span class="svc-state">—</span></div>
-    <div class="svc-pill svc-offline" id="svc-groot"><span class="svc-dot"></span><span class="svc-label">GR00T VLA</span><span class="svc-state">—</span></div>
-    <a href="/reasoning/nemotron" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Full, un-truncated Nemotron reasoning log">🧠 Nemotron Log</a>
-    <a href="/reasoning/cosmos" target="_blank" class="status-pill" style="text-decoration:none; cursor:pointer;" title="Full, un-truncated Cosmos-Reason2 perception log">👁️ Cosmos Log</a>
   </div>
 </header>
 
@@ -860,14 +989,11 @@ HTML = """<!DOCTYPE html>
           <span><svg class="icon" viewBox="0 0 24 24"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3"/></svg> Live Viewport</span>
           <select id="cameraSelector" class="vp-select">
             <option value="scene">3rd Person (Isometric Overview)</option>
-            <option value="front">Front View (Operator Facing)</option>
-            <option value="side">Side Profile (Depth &amp; Height)</option>
-            <option value="top">Top-Down (Bird's Eye Planar)</option>
             <option value="wrist">Wrist Camera (Gripper Close-up)</option>
           </select>
           <span class="vp-badge" id="feedStatus">HTTP Stream</span>
         </div>
-        <span class="fps-readout"><span class="live-tag">● LIVE</span><span id="fpsBadge">— FPS</span></span>
+        <span class="fps-readout"><span class="live-tag"><i class="live-dot"></i>LIVE</span><span id="fpsBadge">— FPS</span></span>
       </div>
       <div class="stream-container">
         <img class="stream-video" id="liveStreamImg" src="" alt="Isaac Sim Live Viewport" />
@@ -936,34 +1062,33 @@ HTML = """<!DOCTYPE html>
         </label>
         <span class="agent-switch-label" id="agentSwitchLabel">Send prompt to Agent</span>
       </div>
+      <div class="agent-switch-row" id="perceptionSwitchRow" title="Off: the arm goes to the simulator's exact object positions (deterministic). On: PURE PERCEPTION — object positions come only from the overview camera (color segmentation + depth); the arm never sees simulator coordinates, and nothing falls back to them. If the camera cannot see an object the task is rejected. Takes effect on the next pick-and-place.">
+        <label class="switch">
+          <input type="checkbox" id="perceptionSwitch" onchange="togglePerception()">
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+        <span class="agent-switch-label" id="perceptionSwitchLabel">Deterministic — sim positions</span>
+      </div>
     </div>
 
     <!-- Quick Tasks -->
     <div class="quick-cmds">
       <div class="section-title">Quick Action Tasks</div>
       <div class="cmd-grid">
-        <div class="cmd-card" onclick="sendRandomize()" style="border-color: rgba(245,158,11,0.35);" title="Places all 3 cubes at genuinely random positions (np.random, not a fixed list) anywhere within the arm's reach, clear of the tray.">
-          <span class="cmd-swatch" style="background:#f59e0b;"></span>
+        <div class="cmd-card" onclick="sendRandomize()" style="border-color: rgba(179,169,143,0.35);" title="Places all 3 cubes at genuinely random positions (np.random, not a fixed list) anywhere within the arm's reach, clear of the tray.">
+          <span class="cmd-swatch" style="background:#b3a98f;"></span>
           <span><svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/></svg> Randomize Cube Positions</span>
         </div>
         <div class="cmd-card" onclick="runQuick('Return robot arm to home configuration')" title="Moves only the robot arm — cube positions are left exactly where they are.">
           <span class="cmd-swatch" style="background:#7e879a;"></span>
           <span>Return to Home Pose (arm only)</span>
         </div>
-        <div class="cmd-card" onclick="sendReset()" style="border-color: rgba(34,211,238,0.3);">
-          <span class="cmd-swatch" style="background:#22d3ee;"></span>
+        <div class="cmd-card" onclick="sendReset()" style="border-color: rgba(134,165,200,0.3);">
+          <span class="cmd-swatch" style="background:#86a5c8;"></span>
           <span>Full Reset — Cubes to Fixed Spots + Home</span>
         </div>
-        <div class="cmd-card" onclick="runQuick('vla: pick up the red cube and place it in the tray')" style="border-color: rgba(139,92,246,0.35);" title="Real closed-loop GR00T-N1.7 inference (camera + language -> action) driving the arm directly, instead of the deterministic PickPlaceController. Not fine-tuned on this scene, so it may not complete the task &#8212; this exercises the real model loop, not scripted motion.">
-          <span class="cmd-swatch" style="background:#8b5cf6;"></span>
-          <span><svg class="icon" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9z"/><path d="M4 9h2M4 15h2M18 9h2M18 15h2M9 4v2M15 4v2M9 18v2M15 18v2"/></svg> Try Real GR00T VLA (experimental)</span>
-        </div>
       </div>
-      <p style="font-size:0.72rem; color:var(--muted); margin-top:10px; line-height:1.5;">
-        Type your own instructions above — e.g. "pick up the green cube and place it in the tray".
-        There's no per-color shortcut button anymore; the model has to actually find the cube
-        you asked for, wherever it randomly ended up.
-      </p>
+      <p style="font-size:0.72rem; color:var(--muted); margin-top:10px; line-height:1.5;">Describe the task in plain language, for example: pick up the green cube and place it in the tray.</p>
     </div>
 
     <!-- Real Agentic Plan (Nemotron decompose -> guardrail -> dispatch -> verify -> replan) -->
@@ -972,12 +1097,11 @@ HTML = """<!DOCTYPE html>
       <div id="planBox">
         <div class="plan-empty">No plan running — type an instruction above.</div>
       </div>
-      <div id="vlaReasoningBox" class="plan-step-detail" style="display:none; margin-top:10px; padding:8px; border-left:2px solid #a78bfa; background:rgba(167,139,250,0.06);"></div>
     </div>
 
     <!-- Cosmos-Reason2 shadow-mode perception (cosmos_integration.md Step 6) -->
     <div class="plan-panel">
-      <div class="section-title"><svg class="icon" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg> Vision Perception (Cosmos-Reason2)</div>
+      <div class="section-title"><svg class="icon" viewBox="0 0 24 24"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"/><circle cx="12" cy="12" r="2.6"/></svg> Vision Perception</div>
       <div id="perceptionBox">
         <div class="plan-empty">No perception snapshot yet — run an instruction.</div>
       </div>
@@ -989,9 +1113,6 @@ HTML = """<!DOCTYPE html>
       <div style="display:flex; flex-direction:column; gap:6px;">
         <div class="api-row"><span>3rd Person Isometric Stream</span><a data-path="/camera/stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>In-Hand Wrist Camera Stream</span><a data-path="/camera/wrist.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Front Operator View Stream</span><a data-path="/camera/front.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Side Profile View Stream</span><a data-path="/camera/side.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
-        <div class="api-row"><span>Top-Down Bird's Eye Stream</span><a data-path="/camera/top.stream" target="_blank">Open <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>Live Joint State JSON</span><a data-path="/state" target="_blank">View /state <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>System Health JSON</span><a data-path="/health" target="_blank">View /health <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
         <div class="api-row"><span>Vision Perception JSON</span><a data-path="/perception" target="_blank">View /perception <svg class="icon-sm" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4L10 14M9 5H5a2 2 0 00-2 2v12a2 2 0 002 2h12a2 2 0 002-2v-4"/></svg></a></div>
@@ -1009,15 +1130,17 @@ HTML = """<!DOCTYPE html>
 </div>
 
 <footer>
-  <span class="stack-chip">Isaac Sim 6.0.1</span>
-  <span class="stack-chip">PhysX (TGS)</span>
-  <span class="stack-chip">RMPFlow</span>
-  <span class="stack-chip">PickPlaceController</span>
+  <span class="stack-chip">Isaac Sim 6.0.1 (Docker)</span>
+  <span class="stack-chip">PhysX</span>
+  <span class="stack-chip">RMPFlow + PickPlaceController</span>
   <span class="stack-chip">Franka Panda 7-DOF</span>
+  <span class="stack-chip">__NEMOTRON_CHIP__</span>
+  <span class="stack-chip">Cosmos 3 Nano Reasoner (NIM)</span>
+  <span class="stack-chip">Colour + depth perception</span>
 </footer>
 
 <script>
-  const bp = window.location.pathname.replace(/\/$/, '');
+  const bp = window.location.pathname.replace(/\\/$/, '');
   // The API/stream directory links are rendered with a relative data-path — resolved here
   // against the real base path (accounts for being served behind a reverse proxy, same as
   // every fetch() below already does via `bp`). Setting bare "/state"-style hrefs directly
@@ -1077,8 +1200,8 @@ HTML = """<!DOCTYPE html>
     const verified = !!step.visual_verified;
     let color, label;
     if (!enforced) { color = 'var(--muted)'; label = 'NOT CHECKED'; }
-    else if (verified) { color = '#4ade80'; label = 'VERIFIED'; }
-    else { color = '#fbbf24'; label = 'VISUAL CHECK DISAGREES'; }
+    else if (verified) { color = '#7fb4c9'; label = 'VERIFIED'; }
+    else { color = '#b3a98f'; label = 'VISUAL CHECK DISAGREES'; }
     const conf = (enforced && step.visual_confidence != null) ? ` · conf ${step.visual_confidence}` : '';
     return `<div class="plan-step-detail" style="color:${color}; margin-top:4px;">
       <span style="font-weight:700; letter-spacing:0.4px;">${label}${conf}</span> — "${step.visual_observed}"
@@ -1099,18 +1222,18 @@ HTML = """<!DOCTYPE html>
     const a = step.cosmos_assessment;
     if (!a) return '';
     if (a.error) {
-      return `<div class="plan-step-detail" style="color:var(--muted); margin-top:4px;">👁 COSMOS: ${a.error}</div>`;
+      return `<div class="plan-step-detail" style="color:var(--muted); margin-top:4px;">COSMOS: ${a.error}</div>`;
     }
-    const feasColor = a.feasibility === 'high' ? '#4ade80' : (a.feasibility === 'medium' ? '#fbbf24' : (a.feasibility === 'low' ? '#f87171' : 'var(--muted)'));
-    const tv = a.target_visible === true ? '✓' : (a.target_visible === false ? '✗' : '?');
-    const dv = a.destination_visible === true ? '✓' : (a.destination_visible === false ? '✗' : (a.destination_visible === null ? '—' : '?'));
+    const feasColor = a.feasibility === 'high' ? '#7fb4c9' : (a.feasibility === 'medium' ? '#b3a98f' : (a.feasibility === 'low' ? '#b88a93' : 'var(--muted)'));
+    const tv = a.target_visible === true ? 'yes' : (a.target_visible === false ? 'no' : 'n/a');
+    const dv = a.destination_visible === true ? 'yes' : (a.destination_visible === false ? 'no' : (a.destination_visible === null ? 'n/a' : 'n/a'));
     let html = `<div class="plan-step-detail" style="margin-top:4px;">
-      <span style="font-weight:700; letter-spacing:0.4px; color:#60a5fa;">👁 COSMOS REASON 2</span>
+      <span style="font-weight:700; letter-spacing:0.4px; color:#8ea3cf;">COSMOS 3 NANO REASONER</span>
       &nbsp;target ${tv} &nbsp;dest ${dv}
       &nbsp;feasibility <span style="color:${feasColor}; font-weight:700;">${(a.feasibility || '?').toUpperCase()}</span>`;
     if (a.approach) html += `&nbsp;· approach: ${a.approach}`;
     if (a.obstacle && a.obstacle.toLowerCase() !== 'none') html += `&nbsp;· obstacle: ${a.obstacle}`;
-    if (a.reasoning) html += `&nbsp;· <a href="${COSMOS_LOG_URL}" target="_blank" style="color:#34d399;">full reasoning →</a>`;
+    if (a.reasoning) html += `&nbsp;· <a href="${COSMOS_LOG_URL}" target="_blank" style="color:#7fb4c9;">View full reasoning</a>`;
     html += '</div>';
     return html;
   }
@@ -1120,8 +1243,8 @@ HTML = """<!DOCTYPE html>
   function renderPlannerReasoning(step) {
     if (!step.planner_reasoning) return '';
     return `<div class="plan-step-detail" style="color:var(--muted); margin-top:4px;">
-      🧠 Nemotron diagnosed this failure and decided how to proceed —
-      <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#60a5fa;">full reasoning →</a>
+      Nemotron diagnosed this failure and chose how to proceed.
+      <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#8ea3cf;">View full reasoning</a>
     </div>`;
   }
 
@@ -1151,10 +1274,15 @@ HTML = """<!DOCTYPE html>
     // shown once, above the step list, so "the planner is thinking" is visible up front.
     if (plan.planning_reasoning) {
       const stepCount = (plan.steps || []).length;
-      html += `<div class="plan-step-detail" style="color:var(--muted); margin:6px 0 10px; padding:8px; border-left:2px solid #60a5fa; background:rgba(96,165,250,0.06);">
-        🧠 <span style="font-weight:700; color:#60a5fa;">NEMOTRON PLANNING</span> — decomposed into ${stepCount} step${stepCount === 1 ? '' : 's'}.
-        <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#60a5fa;">full reasoning →</a>
+      html += `<div class="plan-step-detail" style="color:var(--muted); margin:6px 0 10px; padding:8px; border-left:2px solid #8ea3cf; background:rgba(142,163,207,0.06);">
+        <span style="font-weight:700; color:#8ea3cf;">NEMOTRON PLANNING</span> decomposed the request into ${stepCount} step${stepCount === 1 ? '' : 's'}.
+        <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#8ea3cf;">View full reasoning</a>
       </div>`;
+    }
+    const escHtml = (t) => t.replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+    if (plan.answer && !plan.active) {
+      const bad = ['REJECTED', 'FAILED', 'PARTIAL'].includes(overall);
+      html += `<div class="plan-step-detail" style="margin:8px 0 10px; padding:9px 11px; font-weight:600; line-height:1.45; color:${bad ? '#dcbcc2' : '#bcd9e6'}; border-left:3px solid ${bad ? '#a97480' : '#7fb4c9'}; background:${bad ? 'rgba(169,116,128,0.14)' : 'rgba(127,180,201,0.10)'};">${escHtml(String(plan.answer))}</div>`;
     }
     html += '<div class="plan-steps">';
     for (const step of (plan.steps || [])) {
@@ -1163,7 +1291,9 @@ HTML = """<!DOCTYPE html>
         <div class="plan-step-idx">${step.index}</div>
         <div class="plan-step-body">
           <div class="plan-step-text">${step.text || ''}</div>
-          ${step.detail ? `<div class="plan-step-detail">${step.detail}</div>` : ''}
+          ${step.refused
+            ? `<div class="plan-step-detail" style="color:#dcbcc2; margin-top:6px; padding:8px 10px; border-left:3px solid #a97480; background:rgba(169,116,128,0.14); font-weight:600; line-height:1.45;">Failed: ${escHtml(String(step.detail || '').replace(/^refused by the robot: /, ''))}</div>`
+            : (step.detail ? `<div class="plan-step-detail">${step.detail}</div>` : '')}
           ${renderPlannerReasoning(step)}
           ${renderCosmosAssessment(step)}
           ${renderVisualEvidence(step)}
@@ -1180,7 +1310,7 @@ HTML = """<!DOCTYPE html>
   // grounding call per dispatched pick/place instruction. "used" is always "stage" unless
   // PERCEPTION_MODE=vision is set server-side AND that object's estimate passed the sanity
   // gate; this panel just displays whatever the backend actually did, never assumes.
-  const PERC_LABELS = { red_cube: 'Red Cube', blue_cube: 'Blue Cube', green_cube: 'Green Cube', target_tray: 'Target Tray' };
+  const PERC_LABELS = { red_cube: 'Red Cube', blue_cube: 'Blue Cube', green_cube: 'Green Cube', target_tray: 'Tray' };
   let lastPerceptionJson = null;
   function renderPerception(perc) {
     const box = document.getElementById('perceptionBox');
@@ -1191,12 +1321,13 @@ HTML = """<!DOCTYPE html>
     lastPerceptionJson = json;
 
     const mode = perc ? perc.mode : null;
+    if (mode && !perceptionSwitchUserTouched) setPerceptionSwitchUI(mode === 'pure');
     if (mode) {
       pill.className = 'status-pill mode-' + mode;
-      pillText.textContent = 'PERCEPTION: ' + mode.toUpperCase();
+      pillText.textContent = ({pure: 'Camera only', vision: 'Camera + sim', shadow: 'Sim positions', stage: 'Sim positions'})[mode] || mode;
     } else {
       pill.className = 'status-pill';
-      pillText.textContent = 'PERCEPTION —';
+      pillText.textContent = 'Perception';
     }
 
     if (!perc || !perc.objects || Object.keys(perc.objects).length === 0) {
@@ -1212,7 +1343,7 @@ HTML = """<!DOCTYPE html>
       if (delta == null) {
         deltaHtml = 'no estimate'; deltaColor = 'var(--muted)';
       } else {
-        deltaColor = delta < 20 ? '#4ade80' : (delta < 80 ? '#fbbf24' : '#f87171');
+        deltaColor = delta < 20 ? '#7fb4c9' : (delta < 80 ? '#b3a98f' : '#b88a93');
         deltaHtml = delta.toFixed(1) + ' mm delta';
       }
       html += `<div class="plan-step DONE">
@@ -1224,7 +1355,8 @@ HTML = """<!DOCTYPE html>
     }
     html += '</div>';
     if (perc.latency_ms != null) {
-      html += `<div class="plan-step-detail" style="margin-top:8px;">Cosmos grounding latency: ${perc.latency_ms.toFixed(0)} ms</div>`;
+      const det = perc.detector === 'color' ? 'Color-segmentation' : 'Cosmos grounding';
+      html += `<div class="plan-step-detail" style="margin-top:8px;">${det} latency: ${perc.latency_ms.toFixed(0)} ms</div>`;
     }
     box.innerHTML = html;
   }
@@ -1241,11 +1373,11 @@ HTML = """<!DOCTYPE html>
         if (data.agentic_mode) {
           modePill.className = 'status-pill mode-agentic';
           modeIcon.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="13" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="19" r="2"/><path d="M7.7 7.3L10.5 11.3M16.3 7.3L13.5 11.3M10.7 14.6L7.3 17.5M13.3 14.6L16.7 17.5"/></svg>';
-          modeText.textContent = 'Agentic (Nemotron)';
+          modeText.textContent = 'Agentic';
         } else {
           modePill.className = 'status-pill mode-direct';
           modeIcon.innerHTML = '<svg class="icon-sm" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></svg>';
-          modeText.textContent = 'Direct (no agent)';
+          modeText.textContent = 'Direct';
         }
 
         // 4-service status panel — reflects real process health (poll_service_status in
@@ -1253,7 +1385,7 @@ HTML = """<!DOCTYPE html>
         // toggle is OFF (it's just not being dispatched to), and OFFLINE services show
         // clearly rather than the panel silently omitting them.
         if (data.service_status) {
-          const svcLabels = {isaac_sim: 'Isaac Sim', nemotron: 'Nemotron', cosmos: 'Cosmos', groot: 'GR00T VLA'};
+          const svcLabels = {isaac_sim: 'Isaac Sim', nemotron: 'Nemotron', cosmos: 'Cosmos'};
           for (const [key, label] of Object.entries(svcLabels)) {
             const el = document.getElementById('svc-' + key);
             if (!el) continue;
@@ -1269,19 +1401,6 @@ HTML = """<!DOCTYPE html>
         stageEl.innerHTML = '<span class="stage-dot"></span>STAGE: ' + stage;
         stageEl.className = 'stage-overlay' + (data.busy ? '' : ' idle');
         document.getElementById('stateLabel').textContent = data.stage || 'READY';
-
-        // Real GR00T VLA per-chunk summary (only present once a "vla:" task has run at
-        // least one chunk) — rendered into the same plan box area used for the agent plan,
-        // since VLA tasks bypass the Nemotron orchestrator entirely (opt-in "vla:" prefix).
-        const vlaBox = document.getElementById('vlaReasoningBox');
-        if (vlaBox) {
-          if (data.vla_reasoning) {
-            vlaBox.style.display = '';
-            vlaBox.innerHTML = `<span style="font-weight:700; color:#a78bfa;">🤖 GR00T VLA</span> — ${data.vla_reasoning}`;
-          } else {
-            vlaBox.style.display = 'none';
-          }
-        }
 
         const fps = (data.fps || 0).toFixed(1);
         document.getElementById('fpsBadge').textContent = fps + ' FPS';
@@ -1302,11 +1421,11 @@ HTML = """<!DOCTYPE html>
         const btn = document.getElementById('btnExecute');
         if (data.busy) {
             dot.className = 'dot busy';
-            document.getElementById('statusText').textContent = 'SIMULATION BUSY';
+            document.getElementById('statusText').textContent = 'Sim busy';
             btn.disabled = true;
         } else {
             dot.className = 'dot';
-            document.getElementById('statusText').textContent = 'SYSTEM IDLE';
+            document.getElementById('statusText').textContent = 'Sim idle';
             btn.disabled = false;
         }
 
@@ -1345,22 +1464,19 @@ HTML = """<!DOCTYPE html>
   // MJPEG stream — single persistent connection, ~30 FPS, zero polling overhead
   function connectMJPEGStream() {
       let endpoint = '/camera/stream';
-      if (currentFeed === 'front') endpoint = '/camera/front.stream';
-      else if (currentFeed === 'side') endpoint = '/camera/side.stream';
-      else if (currentFeed === 'top') endpoint = '/camera/top.stream';
-      else if (currentFeed === 'wrist') endpoint = '/camera/wrist.stream';
+      if (currentFeed === 'wrist') endpoint = '/camera/wrist.stream';
 
       liveFeed.src = bp + endpoint;
       liveFeed.onload = () => {
           const names = {
-            scene: 'Overview', front: 'Front View', side: 'Side Profile', top: 'Top-Down', wrist: 'Wrist'
+            scene: 'Overview', wrist: 'Wrist'
           };
-          feedStatus.innerHTML = '<span style="color:#4ADE80;">●</span> Live (' + (names[currentFeed] || currentFeed) + ')';
+          feedStatus.innerHTML = '<span class="feed-dot on"></span>Live (' + (names[currentFeed] || currentFeed) + ')';
           const overlay = document.getElementById('streamLoadingOverlay');
           if (overlay) overlay.style.display = 'none';
       };
       liveFeed.onerror = () => {
-          feedStatus.innerHTML = '<span style="color:#F87171;">●</span> Connecting...';
+          feedStatus.innerHTML = '<span class="feed-dot off"></span>Connecting...';
           const overlay = document.getElementById('streamLoadingOverlay');
           if (overlay) overlay.style.display = 'flex';
           setTimeout(connectMJPEGStream, 2500); // Retry every 2.5s
@@ -1412,6 +1528,31 @@ HTML = """<!DOCTYPE html>
   // /state polls (which may still report the pre-toggle value while the request is in
   // flight) don't visually snap it back before the server confirms the real new state.
   let agentSwitchUserTouched = false;
+  let perceptionSwitchUserTouched = false;
+  function setPerceptionSwitchUI(vision) {
+    document.getElementById('perceptionSwitch').checked = vision;
+    document.getElementById('perceptionSwitchLabel').textContent =
+      vision ? 'Pure perception — camera only' : 'Deterministic — sim positions';
+    document.getElementById('perceptionSwitchRow').classList.toggle('on', vision);
+  }
+  async function togglePerception() {
+    const vision = document.getElementById('perceptionSwitch').checked;
+    perceptionSwitchUserTouched = true;
+    setPerceptionSwitchUI(vision);
+    try {
+      const res = await fetch(bp + '/perception_mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vision })
+      });
+      if (!res.ok) setPerceptionSwitchUI(!vision);   // switch failed — show the real state
+    } catch(e) {
+      setPerceptionSwitchUI(!vision);
+    } finally {
+      perceptionSwitchUserTouched = false;
+    }
+  }
+
   async function toggleAgent() {
     const sw = document.getElementById('agentSwitch');
     const enabled = sw.checked;
@@ -1459,9 +1600,40 @@ HTML = """<!DOCTYPE html>
 """
 
 # ─── API ROUTES ───────────────────────────────────────────────────────────────
+def _pretty_model(model_id: str) -> str:
+    """'nvidia/nemotron-3.5-lightning-30b-a3b' -> 'Nemotron 3.5 Lightning 30B-A3B' (follows the configured model)."""
+    words = []
+    for w in model_id.split("/")[-1].split("-"):
+        if re.fullmatch(r"\d+(\.\d+)?b|a\d+b", w, re.I):
+            words.append(w.upper())
+        else:
+            words.append(w if re.search(r"\d", w) else w.capitalize())
+    return re.sub(r"(\d+B) (A\d+B)", r"\1-\2", " ".join(words))
+
+
+def _nemotron_label(short: bool = False) -> str:
+    m = _pretty_model(cfg.NEMOTRON_MODEL or "Nemotron")
+    if short:
+        m = re.sub(r"-A\d+B$", "", m)                      # '30B-A3B' -> '30B' for the header
+    return m if m.lower().startswith("nemotron") else f"Nemotron ({m})"
+
+
+def _stack_line() -> str:
+    """The header subtitle: the stack that is actually configured, not a hard-coded description."""
+    return " · ".join(["Isaac Sim 6.0.1", _nemotron_label(short=True), "Cosmos 3 Nano Reasoner"])
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return HTML
+    return HTML.replace("__STACK_LINE__", _stack_line()).replace("__NEMOTRON_CHIP__", f"{_nemotron_label()} (NVIDIA API)")
+
+
+@app.get("/ntt_data_logo.png")
+async def ntt_logo():
+    path = Path(__file__).parent / "static" / "ntt_data_logo.png"
+    if not path.is_file():
+        return Response(status_code=404)
+    return Response(content=path.read_bytes(), media_type="image/png", headers={"Cache-Control": "max-age=3600"})
 
 @app.get("/health")
 async def health():

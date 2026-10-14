@@ -1,159 +1,144 @@
-# Physyk — Agentic Pick-and-Place
+# Physyk AI — Agentic Pick-and-Place
 
-## Problem Statement
+Tell a simulated Franka Panda arm what to do in plain English. Physyk plans the steps, finds the objects by looking at camera images, executes the motion in NVIDIA Isaac Sim, and checks the real outcome before reporting success.
 
-Most robots in a factory today can only do one thing, one way, forever. You program a robot
-arm to pick up a part from exactly position X and put it down at exactly position Y, and
-that's all it will ever do — the moment the part moves, the layout changes, or someone gives
-it a new instruction in plain English, it breaks. Re-programming a robot for a new task
-usually means an engineer sitting down and hand-coding new motion paths, which can take days.
+> **Status:** three coloured cubes (red, green, blue) and a yellow tray on a work table inside a factory-floor scene (conveyor, yellow robot cell, racking, tool cabinet). Prompts such as "put the red cube in the tray", "put the green cube on top of the blue cube" or "stack the cubes" run end to end. "Stack the cubes" is planned by a local, deterministic planner and is re-planned from the live scene after every step. A GUI switch runs the whole thing from the camera alone, with no simulator coordinates.
 
-**Physyk asks a simple question:** what if you could just *tell* the robot what to do — in
-plain English, with the layout allowed to change — and have it figure out the rest, verify
-its own work, and recover when something goes wrong?
-
-## Objectives
-
-1. **Understand natural-language instructions** ("pick up the red cube and place it in the
-   tray") without hand-coded, per-task programming.
-2. **Adapt to a changing scene** — object positions aren't fixed or hardcoded; the robot
-   perceives where things actually are before acting.
-3. **Verify real outcomes, not assumptions** — confirm a task actually succeeded using live
-   sensor/position data, not just "the motion finished so it must have worked."
-4. **Recover from failure automatically** — retry, re-plan, or escalate when a pick or
-   placement doesn't go as expected, instead of silently reporting success.
-5. **Explore a fully learned, vision-driven alternative** (a Vision-Language-Action model)
-   alongside the reliable scripted path, as a research/demo track toward robots that learn
-   physical skills from demonstration rather than being explicitly programmed for them.
-
-## Core Capabilities
-
-- **Instruction Parsing** — extracts the source object and destination target from
-  natural-language commands.
-- **Physics Simulation** — executes robot motion using a Franka Panda arm in NVIDIA Isaac
-  Sim, with real gravity, contact, and friction.
-- **Deterministic Control** — uses a validated 10-phase grasp-and-place state machine as the
-  default execution path.
-- **Motion Planning** — RMPFlow generates collision-aware joint targets for safe arm movement.
-- **VLA Control** — GR00T-N1.7 predicts end-effector motion from scene images, wrist-camera
-  frames, and robot pose.
-- **Closed-Loop Execution** — executes 16-step action chunks and re-observes the environment
-  after each chunk.
-- **Outcome Verification** — compares live simulator telemetry with the target position to
-  determine actual task success.
-
----
-
-## 1. Pick-and-Place — the physical layer
-
-At the bottom of everything is one simple, reliable capability: **a Franka Panda robot arm
-that can pick up an object from wherever it actually is, and place it wherever it's told to.**
-This runs inside NVIDIA Isaac Sim, a physics simulator, so every grasp, lift, and placement is
-real simulated physics (gravity, contact, friction) — not animation.
-
-- The arm figures out *what* to pick up and *where* to put it down from the instruction text.
-- Motion is handled by a validated 10-step sequence (approach → descend → grasp → lift →
-  transport → place → release → retreat) using collision-aware path planning, so the arm
-  routes around other objects instead of clipping through them.
-- After every task, the system checks the object's **real final position** against where it
-  was supposed to land — success or failure is measured, not assumed.
-
-This scripted path is the **reliable, default way** the robot executes tasks today.
-
-## 2. GR00T & VLA — the experimental, learned alternative
-
-Alongside the scripted path, Physyk has an **experimental** second way of controlling the arm:
-**NVIDIA's GR00T-N1.7**, a Vision-Language-Action (VLA) model — a type of AI that looks at
-camera images and directly predicts robot motion, the same way a language model predicts the
-next word, except its "words" are joint movements.
-
-- **How it works:** the model looks at a camera image of the scene plus the arm's current
-  wrist camera view, and predicts a short sequence of moves (16 steps at a time). After each
-  sequence, it looks again and predicts the next one — a closed loop of *observe → act →
-  observe again*, not a single blind guess.
-- **Why it's separate from the reliable path:** this GR00T model was originally trained on a
-  different simulated benchmark (LIBERO), not on Physyk's own table/cubes/cameras — so out of
-  the box, it doesn't reliably pick up Physyk's objects. It's wired in as an opt-in,
-  experimental mode (triggered with a `vla:` prefix) specifically so it can be demonstrated
-  and improved without risking the reliability of the main system.
-- **What we're doing about it:** fine-tuning — showing the model example demonstrations
-  recorded from Physyk's *own* scene, so it learns to recognize *these* cubes, *this* camera
-  angle, and *this* table, instead of relying on what it learned from a different simulator.
-  Early fine-tuning attempts (see Challenges below) show real, scene-relevant motion, but not
-  yet reliable grasp success — more training examples are the clear next step.
-
----
-
-## 3. Agentic Orchestration — Nemotron & Cosmos
-
-*(Architecture and implementation owned separately — summarized here for context only.)*
-
-Above the physical pick-and-place layer sits a reasoning layer that turns a free-form,
-possibly multi-step instruction into a sequence of pick-and-place calls, using an LLM
-(Nemotron) to plan and a perception layer (Cosmos) to help interpret the scene:
+## How it works
 
 ```
-Instruction → [Nemotron: decompose into steps] → [guardrails check each step]
-      → dispatch to the physical layer above → [verify against real telemetry]
-      → retry / re-plan on failure → repeat until done or genuinely stuck
+Instruction ─► planner ─► guardrails ─► Isaac Sim (Franka Panda, RMPFlow, PickPlaceController)
+                 │                                │
+   "stack ..." ─► local stack planner             ▼
+   other text ─► Nemotron              verify against live positions
+                                       (simulator pose, or a fresh camera look)
+                                                  │
+        retry / re-plan  ◄────────────────────────┘      Cosmos adds a visual second opinion
 ```
 
-This is what allows an instruction like *"put the green cube in the tray, then stack the blue
-cube on the red cube"* to become a safely-sequenced, self-checking plan instead of a single
-scripted call. *(Full architecture diagram to be provided separately by the orchestration
-owner.)*
-
----
-
-## Why This Approach — vs. What Exists Today
-
-| Today's typical approach | Physyk |
+| Component | Role |
 |---|---|
-| Fixed, pre-programmed motion paths per task | Understands free-form natural-language instructions |
-| Assumes objects are exactly where expected | Perceives live object positions before acting |
-| "Motion completed" is treated as "task succeeded" | Real position verification after every action — failures are actually caught |
-| A failure needs a human to intervene | Automatic retry / re-plan loop before escalating |
-| Either fully scripted OR a black-box learned model, rarely both | Reliable scripted execution by default, with a learned (VLA) path available and improvable side-by-side, so learned-AI robotics can be evaluated without giving up reliability |
+| **Isaac Sim 6.0.1** (Docker) | Physics (60 Hz) and two cameras (overview, wrist) |
+| **Nemotron 3.5 Lightning 30B-A3B** (NVIDIA hosted API) | Turns free-form instructions into pick/place steps; diagnoses failures |
+| **Local stack planner** (`stack_planner.py`) | Plans "stack the cubes" from positions alone: which cube is the base, which moves next, where blockers go |
+| **Camera-only perception** (GUI switch) | Colour masks + depth find the cubes by looking, about 20 ms; the arm then uses camera poses only |
+| **Cosmos 3 Nano Reasoner** (local NIM) | Independent visual check of each step (evidence only; never gates the arm) |
+| **Backend + GUI** | FastAPI on port 7860, talking to the sim on port 8100 |
 
-## Customer Benefits & Industry Applications
+## What it can do
 
-- **Faster changeover** — reconfiguring what a robot does is an instruction, not a
-  re-programming project, which matters most in low-volume/high-mix manufacturing, kitting,
-  and warehouse sorting.
-- **Fewer silent failures** — real verification and automatic retry reduce the "robot said
-  it worked but it didn't" problem that costs downstream time to discover manually.
-- **Natural-language operation** — floor operators can direct the system without robotics
-  programming expertise, lowering the skill bar for day-to-day operation.
-- **A visible path to learned robotics** — the VLA track gives an organization a live,
-  working example of where foundation-model robotics is headed, without betting the whole
-  operation's reliability on a model that isn't production-ready yet.
+- **Pick and place** a cube into the tray, onto another cube, beside another cube ("right of", "next to", ...), or onto a free spot on the table.
+- **Stack** ("stack the cubes", "... in the tray", "... on the table", "build a tower", "stack them"). Always a vertical pile, planned from positions and never from colour. It handles piles already standing in the tray or on the table (taken apart from the top), partial piles of one or two cubes, cubes standing close together, covered cubes (never picked until the cube on top has moved) and a missing or out-of-reach cube (refused with a clear reason). Details: `ARCHITECTURE.md` §3 and `TECHNICAL_DEEP_DIVE.md` §3.
+- **Free spots**: when a cube has to be put out of the way, the spot is inside a safe zone: away from the robot base, inside reach, clear of the tray, and apart from every other cube.
+- **Verification**: every step is checked against the cube's real final position (deterministic mode) or a fresh camera look (camera-only mode), plus a Cosmos visual check that runs beside the arm.
+- **Failure handling**: a failed stacking step is planned again from the live positions. Other steps get Nemotron's diagnosis (retry, re-plan the step, re-plan the rest).
 
----
+## Scene
 
-## Challenges We Faced
+A work table (0.9 x 1.3 m, top at Z = 0), a yellow tray, three 5 cm cubes and the arm. Behind them is a visual-only factory backdrop (`factory_background.py`): polished floor, walls and ceiling, a conveyor with cartons, a yellow robot cell with a safety rail, racking, a tool cabinet and table legs. Nothing in the backdrop has physics. `PHYSYK_BACKGROUND=grid` restores the original blue-grid ground. The backdrop can be rebuilt live with `POST :8100/background/rebuild`.
 
-Real problems hit and (mostly) fixed along the way — kept here honestly rather than
-polished away:
+## Motion control (this branch)
 
-- **One-fingered grasp bug** — one of the gripper's two fingers shipped with zero drive
-  strength, meaning only one finger was ever actually closing. Fixed at the asset/gain level.
-- **Blind motion planner** — the path planner didn't know about the table, tray, or other
-  cubes as obstacles for a long stretch of development, so the arm could clip through them.
-  Fixed by registering real collision obstacles.
-- **Grasp timing** — the gripper was starting to move (lift) before it had actually finished
-  closing on the object, causing it to grab an edge and later slip mid-motion. Fixed by
-  giving the close/settle phases more real time before motion resumes.
-- **Camera framing** — cameras originally missed the edges of the table and cropped the robot
-  itself out of frame; separately, the wrist camera couldn't see cubes near the table's edges
-  during approach. Both addressed by widening the relevant camera field-of-view.
-- **Fake success reporting** — task verification used to be a hardcoded "always pass," so a
-  failed pick could be silently reported as successful. Replaced with a real position check
-  against live simulator telemetry.
-- **VLA training data volume** — a first fine-tuning pass on the experimental GR00T VLA path
-  used a small number of demonstration episodes; the model showed real, scene-relevant motion
-  but not yet reliable grasp completion — it tends to repeat a similar motion each step rather
-  than visually correcting itself. More demonstration episodes per skill are the identified
-  fix, already scoped for a future pass.
-- **Out-of-domain VLA checkpoint** — the GR00T model wasn't trained on Physyk's own cubes,
-  table, or camera angles to begin with, so out-of-the-box performance on colored cubes is
-  poor — expected, and the reason the fine-tuning work above exists at all.
+NVIDIA's open-loop 10-phase `PickPlaceController` on RMPFlow, with the Franka's stock drive gains.
+
+- Motion phases run at 1.25x; settle, close and release run at NVIDIA's timing, lengthened for a firm grasp.
+- Grasp confirmation reads the gripper's achieved width; a grasp that closed on nothing aborts early.
+- Post-place verification compares the cube's real position with its target (3 cm in XY, 3.5 cm in Z).
+- The table, the tray and the cubes are registered with RMPFlow as obstacles at start-up; see `TECHNICAL_DEEP_DIVE.md` §1.3 for why they are probably not active in practice.
+- The hand is not turned to the cube's faces, and the controller does not wait for the arm to arrive between phases: phases advance on a timer. The known consequences are in `TECHNICAL_DEEP_DIVE.md` §5.
+- The agent's guardrail refuses targets outside x 0.20-0.70 m, y -0.45..0.45 m, z -0.01..0.50 m, or closer than 0.36 m to the base (the wrist reaches its joint limit).
+
+## Requirements
+
+- Linux with an NVIDIA GPU (developed on a 24 GB laptop GPU) and Docker with the NVIDIA runtime
+- Access to the Isaac Sim 6.0.1 container and the Cosmos 3 NIM image on NGC
+- An NVIDIA API key for the hosted Nemotron model
+- Python 3 for the backend
+
+## Setup
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install fastapi 'uvicorn[standard]' httpx opencv-python-headless numpy pillow
+
+cp .env.example .env      # then add your NVIDIA API key; .env is git-ignored
+```
+
+## Run
+
+```bash
+./start_sim_docker.sh      # terminal 1: Isaac Sim (serves on :8100); Ctrl+C stops the container
+./start_cosmos_docker.sh   # optional: Cosmos NIM (serves on :8001)
+./run.sh                   # terminal 2: backend + GUI on http://localhost:7860
+
+./run.sh --status          # health of everything
+./run.sh --no-agent        # skip the LLM; send instructions straight to the sim
+./run.sh --stop            # stop the backend
+```
+
+The sim service always runs headless in its container; the GUI at `localhost:7860` is the viewport. Full setup notes are in `instructions.md`.
+
+### Settings (environment variables, all optional)
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NVIDIA_API_KEY` / `NEMOTRON_API_KEY` | — | Key for the hosted Nemotron model (`.env`) |
+| `NEMOTRON_MODEL` | `nvidia/nemotron-3.5-lightning-30b-a3b` | Planner model id |
+| `NEMOTRON_BASE_URL` | `https://integrate.api.nvidia.com/v1` | A local OpenAI-compatible server also works |
+| `COSMOS_BASE_URL` / `COSMOS_MODEL` | `http://localhost:8001/v1` / `nvidia/cosmos3-nano-reasoner` | The local Cosmos NIM |
+| `PHYSYK_STACK_PLANNER` | `code` | `code` = local stack planner; `llm` = let Nemotron plan stacking (slow, unreliable with a thinking model) |
+| `PHYSYK_AGENTIC` | `1` | `0` sends every instruction straight to the sim (`./run.sh --no-agent`) |
+| `PHYSYK_ENCODE_EVERY` | `2` | JPEG-encode the camera streams every Nth loop iteration (frees time for physics) |
+| `PHYSYK_BACKGROUND` | `factory` | `grid` = original blue-grid ground |
+| `PERCEPTION_MODE` | `shadow` | Start-up perception mode; the GUI switch changes it live (leave unset) |
+| `PERCEPTION_DETECTOR` | `color` | `cosmos` uses Cosmos's own grounding (1.5-3 s per call; not for live use) |
+| `PERCEPTION_ZCAL` | `1` | Table-plane self-calibration of detected heights |
+| `PHYSYK_SIM_CONTAINER` | `physyk-isaac-sim` | Container the GUI's Isaac Sim pill follows |
+
+## Tests (offline; no simulator, arm or network)
+
+```bash
+python3 workspace/scripts/test_stack_planner.py [layouts]   # planner scenarios + fuzz + safe-zone rules
+.venv/bin/python workspace/scripts/test_stack_agent.py      # the agent loop against a fake simulator
+```
+
+The planner suite runs 48 named scenarios and thousands of random layouts on every surface (tray, table, anywhere), with noisy positions, 2-4 cubes, covered and out-of-reach cubes, and checks that every plan ends as one pile with the minimum number of moves. It also checks that Randomize and free spots always stay inside the safe zone. The agent test runs the real `NeMoRoboticsAgent.run()` loop against a fake sim that can drop cubes at random. Last results: all passed (see `TECHNICAL_DEEP_DIVE.md` §3.6).
+
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `workspace/isaac_sim_service.py` | Sim loop, scene, controller phases, perception wiring, HTTP API on :8100 |
+| `workspace/physyk_agent_orchestrator.py` | Planner (Nemotron + stack planner), guardrails, dispatch / verify / retry |
+| `workspace/stack_planner.py` | The local stacking planner and the shared safe-zone rules |
+| `workspace/physyk_main_server.py` | GUI and gateway on :7860 |
+| `workspace/physyk_perception/` | Camera detector, provider, overlay layout, Cosmos client, step verifier |
+| `workspace/factory_background.py` | The visual-only factory backdrop |
+| `workspace/reasoning_dashboard.py` | The Nemotron / Cosmos log pages |
+| `workspace/physyk_config.py` | Endpoints, keys and model names (from `.env`) |
+| `workspace/static/` | The NTT DATA logo used in the GUI header |
+| `workspace/scripts/` | The offline tests |
+| `assets/franka_panda/` | Franka Panda URDF / mesh reference files (the sim loads the arm from Isaac Sim's own asset library) |
+| `run.sh`, `start_*_docker.sh` | Launchers |
+
+## Documentation
+
+| Doc | For |
+|---|---|
+| `HOW_IT_WORKS.md` | Plain-English walkthrough, no code |
+| `instructions.md` | Setup, running, GUI use, troubleshooting |
+| `ARCHITECTURE.md` | Service topology, the pick-and-place flow, the agent loop, the stack planner, state models, known gaps |
+| `TECHNICAL_DEEP_DIVE.md` | Controller phases, orchestration, the planner in depth, perception, scene, performance, open problems |
+| `PERCEPTION.md` | The camera-only pipeline: detector, calibration, measurements, limits |
+| `cosmos_integration.md` | How Cosmos is deployed and used |
+| `PROJECT_NARRATIVE.md` | The project write-up: objectives, capabilities, challenges and how they were handled |
+| `HISTORY.md` | The setups the project has gone through, including the restart from the 22 August code |
+| `INDUSTRY_APPLICATIONS.md` | Where this applies, and Q&A prep |
+| `CLAUDE.md` | Working notes for Claude Code sessions in this repo |
+
+## Notes
+
+- Keep the laptop plugged in; a power-capped GPU slows the sim noticeably.
+- The sim container (`physyk-isaac-sim`) and port 8100 are shared by every run; stop one before starting another.
+- Never commit `.env`; it holds API keys.
+- The cube colour thresholds in `workspace/physyk_perception/color_segment.py` are tuned to the default studio lighting. The table-plane calibration adapts to how bright the table is, but re-check the detection if the lighting or the table colour changes.

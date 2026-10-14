@@ -22,6 +22,14 @@ from . import cosmos_client
 
 VERIFY_TIMEOUT_S = 6.0
 
+# The overview shot is wide (the cubes are ~20 px across) and the "tray" is a flat yellow slab, which the model does not read
+# as a tray: without this key it answers "the tray is not visible" and rates every tray task low feasibility.
+SCENE_KEY = (
+    "Scene key: the table holds up to three small 5 cm cubes (red, green, blue), which may be stacked on each other, and a flat "
+    "yellow square slab - that slab IS the 'tray'. The robot is the white arm. 'On top of a cube' means resting on that cube's "
+    "top face; 'in the tray' means resting on the yellow slab. "
+)
+
 
 @dataclasses.dataclass
 class VerifyVerdict:
@@ -50,14 +58,14 @@ def verify_step(get_frame: Callable[[], Optional[Tuple[bytes, str]]], action: st
     if action == "pick_place" and obj:
         loc = destination or "its intended destination"
         question = (
-            f"Look at this image of a tabletop robotic workspace. Is the {obj} now located "
+            f"Look at this image of a tabletop robotic workspace. {SCENE_KEY}Is the {obj} now located "
             f"at or on {loc}? Answer with ONLY a JSON object: "
             '{"result": true/false, "confidence": <0.0-1.0>, "observed": '
             '"<one short sentence describing what you actually see>"}'
         )
     else:
         question = (
-            f"Look at this image of a tabletop robotic workspace. Describe where the {obj} "
+            f"Look at this image of a tabletop robotic workspace. {SCENE_KEY}Describe where the {obj} "
             f"currently is. Answer with ONLY a JSON object: "
             '{"result": true, "confidence": <0.0-1.0>, "observed": "<one short sentence>"}'
         )
@@ -90,7 +98,7 @@ class AssessVerdict:
 
 def assess_pick_place(get_frame: Callable[[], Optional[Tuple[bytes, str]]], target: str,
                        destination: str, timeout: float = VERIFY_TIMEOUT_S) -> AssessVerdict:
-    """Pre-dispatch visual reasoning call (cosmos_integration.md's own "COSMOS REASON 2"
+    """Pre-dispatch visual reasoning call (cosmos_integration.md's own "COSMOS 3 NANO REASONER"
     panel: target visible / destination visible / obstacle / feasibility / approach) — purely
     informational, never gates or blocks the dispatch (matches every other Cosmos hook in this
     module: real evidence shown to the operator, zero effect on what the robot actually does).
@@ -105,8 +113,11 @@ def assess_pick_place(get_frame: Callable[[], Optional[Tuple[bytes, str]]], targ
 
     dest_desc = destination or "no specific destination stated"
     question = (
-        f"Look at this image of a tabletop robotic workspace with a Franka Panda arm. A robot "
-        f"is about to pick up the {target} and place it at: {dest_desc}. Answer with ONLY a "
+        f"Look at this image of a tabletop robotic workspace with a Franka Panda arm. {SCENE_KEY}A robot "
+        f"is about to pick up the {target} and place it at: {dest_desc}. Rate feasibility 'high' when the {target} is visible with "
+        f"a free top face and the destination is a clear spot (or surface) it can reach; 'medium' when something is close "
+        f"enough to make it tight; 'low' ONLY when the {target} is covered by another cube, blocked, or truly not in the "
+        f"image. Do not rate low just because objects are small. Answer with ONLY a "
         f"JSON object: {{\"target_visible\": true/false, \"destination_visible\": true/false, "
         f"\"obstacle\": \"<short description of anything blocking the path, or 'none'>\", "
         f"\"feasibility\": \"low\"/\"medium\"/\"high\", \"approach\": \"<short recommended "

@@ -19,19 +19,12 @@ import math
 import base64
 import threading
 import queue
+import collections
 import urllib.request
 import urllib.error
 import json as jsonlib
 import cv2
 import numpy as np
-
-# GR00T fine-tuning episode recorder — no-op unless RECORD_EPISODES=1 is set in the
-# environment (see groot_episode_recorder.py). Purely additive: does not change any existing
-# control flow when disabled (the default).
-from groot_episode_recorder import EpisodeRecorder
-episode_recorder = EpisodeRecorder(
-    output_dir=os.environ.get("RECORD_EPISODES_DIR", "/workspace/finetune_data/raw_episodes")
-)
 
 # ── 1. Boot Isaac Sim SimulationApp ───────────────────────────────────────────
 from isaacsim import SimulationApp
@@ -231,7 +224,20 @@ def _retint_ground_plane(prim_path: str, tint_rgb=(0.10, 0.16, 0.34)):
         print("[Isaac Sim Service] WARN: no diffuse_tint/diffuse_color_constant input found on "
               "ground plane material — left at its default color.", flush=True)
 
-_retint_ground_plane("/World/defaultGroundPlane")
+# Scene backdrop (aesthetics only — nothing here has physics): "factory" (default) = factory_background.py; "grid" = the
+# original blue grid ground. The physics ground plane above stays exactly where it was in both modes; the factory floor
+# is a separate visual floor further down, so the arm, table, tray and cubes behave identically.
+BACKGROUND = os.environ.get("PHYSYK_BACKGROUND", "factory").lower()
+if BACKGROUND == "grid":
+    _retint_ground_plane("/World/defaultGroundPlane")
+else:
+    try:
+        UsdGeom.Imageable(stage.GetPrimAtPath("/World/defaultGroundPlane")).MakeInvisible()
+        import factory_background
+        factory_background.build(stage)
+    except Exception as e:
+        print(f"[WARN] Factory background failed (non-fatal, scene still runs): {e}", flush=True)
+background_rebuild_event = threading.Event()   # set by POST /background/rebuild; handled in the sim loop
 
 # Fixed Static Work Table (Immovable, rock-solid surface at Z = 0.00)
 work_table_obj = world.scene.add(
@@ -378,33 +384,22 @@ def reset_scene_cubes():
             print(f"[Reset Obj Error] {key}: {e}", flush=True)
     print("[Isaac Sim Service] All scene cubes reset to designated table coordinates.", flush=True)
 
-# Reachable-workspace bounds for random cube placement — clear of the tray footprint
-# (X=[0.31,0.53], Y=[-0.44,-0.20]) and comfortably within arm reach.
-CUBE_RANDOM_X_RANGE = (0.28, 0.65)
-CUBE_RANDOM_Y_RANGE = (-0.15, 0.55)
-CUBE_MIN_SEPARATION = 0.10  # meters between cube centers, so they don't spawn overlapping
+# Randomize and the free-spot search share one safe-zone definition (stack_planner.py): every cube is placed well inside the
+# arm's reach, away from the robot base, clear of the tray with room for the open hand, and apart from the other cubes.
+import stack_planner as stack_rules
+
 
 def randomize_scene_cubes():
-    """Places all 3 cubes at genuinely random XY positions each call (np.random, not a fixed
-    list) within the arm's reachable workspace, clear of the tray, with a minimum separation
-    so they don't spawn on top of each other."""
+    """Places all cubes at random XY positions inside the safe zone (see stack_planner.SAFE_*): not close to the robot base,
+    not out of reach, not hugging the tray, with CUBE_SEP_M between cube centres."""
+    keys = [k for k in SCENE_OBJECTS if k != "target_tray"]
+    sites = stack_rules.random_cube_sites(len(keys), np.random.uniform)
     placed = []
-    for key in SCENE_OBJECTS:
-        if key == "target_tray":
-            continue
+    for key, (x, y) in zip(keys, sites):
         try:
             obj = world.scene.get_object(key)
             if obj is None:
                 continue
-            x, y = None, None
-            for _attempt in range(50):
-                cx = float(np.random.uniform(*CUBE_RANDOM_X_RANGE))
-                cy = float(np.random.uniform(*CUBE_RANDOM_Y_RANGE))
-                if all(math.hypot(cx - px, cy - py) >= CUBE_MIN_SEPARATION for px, py in placed):
-                    x, y = cx, cy
-                    break
-            if x is None:  # 50 rejection-sampling attempts failed (very unlikely with 3 cubes)
-                x, y = cx, cy
             placed.append((x, y))
             obj.set_world_pose(position=np.array([x, y, 0.025]), orientation=np.array([1.0, 0.0, 0.0, 0.0]))
             obj.set_linear_velocity(np.zeros(3))
@@ -495,17 +490,7 @@ RIG_LOOK_AT = (0.35, 0.0, 0.28)
 # 1. Overview Camera (Isometric 3/4 view, rich cinematic framing of robot, table, cubes, and tray)
 scene_cam = rep.create.camera(position=(1.85, -1.55, 1.30), look_at=RIG_LOOK_AT, focal_length=22.0)
 
-# 2. Front Camera (Direct operator viewpoint, pulled back so the table's dark top surface
-#    doesn't dominate the frame, and raised/re-aimed so the robot is actually in shot)
-front_cam = rep.create.camera(position=(1.95, 0.0, 0.90), look_at=RIG_LOOK_AT, focal_length=22.0)
-
-# 3. Side Camera (Profile view showing vertical height clearance and depth transit)
-side_cam = rep.create.camera(position=(0.35, -1.75, 0.85), look_at=RIG_LOOK_AT, focal_length=22.0)
-
-# 4. Top-Down Camera (Bird's eye planar layout — robot base through to the tray)
-top_cam = rep.create.camera(position=(0.35, 0.0, 2.00), look_at=(0.35, 0.0, 0.05), focal_length=24.0)
-
-# 5. Wrist Camera (Mounted on panda_hand, offset to the side so a grasped object sits beside
+# 2. Wrist Camera (Mounted on panda_hand, offset to the side so a grasped object sits beside
 #    the frame instead of dead-center blocking it — see fix history below)
 #
 # BUG #1 (original): mounted 0.07m out along the hand's Z axis, but the actual fingertip
@@ -575,7 +560,7 @@ SCENE_CAM_INTRINSICS = {
 # Extrinsics: this camera never moves (fixed position/look_at, set once above), so its world
 # transform is computed once, analytically, from those exact same values via a standard
 # look-at construction — USD/Replicator cameras look down their own local -Z axis, and this
-# stage's world up-axis is Z (confirmed by this file's own top_cam, positioned high on Z and
+# stage's world up-axis is Z (confirmed by the overview camera, positioned high on Z and
 # looking straight down). If SCENE_CAM_POSITION/SCENE_CAM_LOOK_AT below ever change, this
 # must be recomputed alongside them — they're kept in one place for exactly that reason.
 SCENE_CAM_POSITION = np.array([1.85, -1.55, 1.30])
@@ -620,7 +605,8 @@ perception_camera_state = {
 # only new thing this adds is a real Cosmos grounding call per dispatched pick/place
 # instruction, purely for logging a delta via /perception — zero effect on robot behavior
 # unless PERCEPTION_MODE=vision is explicitly set.
-from physyk_perception.provider import PerceptionProvider
+from physyk_perception.provider import PerceptionProvider, PerceptionUnavailable
+from physyk_perception.overlay_layout import layout_labels
 
 _PERCEPTION_LABEL_MAP = {
     "red_cube": "red cube", "blue_cube": "blue cube",
@@ -643,20 +629,83 @@ perception_provider = PerceptionProvider(
     mode=os.environ.get("PERCEPTION_MODE", "shadow"),
     workspace_aabb=_PERCEPTION_WORKSPACE_AABB,
     crop_aabb=_PERCEPTION_CROP_AABB,
+    # Table and tray never move — in pure-perception mode the tray is this calibration constant
+    # (matches where the FixedCuboid is created above), not read from the stage or detected.
+    fixed_poses={"target_tray": np.array([0.42, -0.32, 0.015])},
 )
-print(f"[Perception] Cosmos provider initialized in '{perception_provider.mode}' mode", flush=True)
+print(f"[Perception] Provider initialized: mode='{perception_provider.mode}' detector='{perception_provider.detector}'", flush=True)
 
-rp_front = rep.create.render_product(front_cam, CAM_RES)
-front_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-front_annot.attach([rp_front])
 
-rp_side = rep.create.render_product(side_cam, CAM_RES)
-side_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-side_annot.attach([rp_side])
+def decision_pos(obj_key):
+    """Pose the planner should act on. 'shadow'/'stage': simulator ground truth (deterministic
+    path). 'pure': camera-derived only — raises PerceptionUnavailable if the object isn't seen."""
+    return perception_provider.get_object_pose(obj_key)
 
-rp_top = rep.create.render_product(top_cam, CAM_RES)
-top_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-top_annot.attach([rp_top])
+
+def fresh_decision_pos(obj_key):
+    """Re-localize from the CURRENT camera frame, then return decision_pos. Used for post-place
+    verification so 'did it land there?' is answered by looking, not by reading the stage."""
+    if perception_provider.mode == "pure":   # deterministic mode reads the stage; no detector call
+        try:
+            perception_provider.refresh(list(_PERCEPTION_LABEL_MAP))
+        except Exception as e:
+            print(f"[Perception] Fresh refresh failed (non-fatal): {e}", flush=True)
+    return decision_pos(obj_key)
+
+
+perception_log = collections.deque(maxlen=40)   # newest last; entries carry an annotated JPEG
+_perception_log_id = 0
+
+
+def log_perception_event(event: str, note: str = ""):
+    """Records what the camera saw right now — an annotated overview frame (boxes + estimated
+    XYZ) plus the per-object estimates — for the GUI's Perception Log page. Pure mode only.
+    Never raises: logging must not be able to break a task."""
+    global _perception_log_id
+    if perception_provider.mode != "pure":
+        return
+    try:
+        raw = scene_annot.get_data()
+        if raw is None or raw.size == 0:
+            return
+        bgr = cv2.cvtColor(raw[:, :, :3], cv2.COLOR_RGB2BGR)
+        bgr = draw_perception_overlay(bgr)
+        ok, enc = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        if not ok:
+            return
+        snap = perception_provider.snapshot()
+        objs = {}
+        for key, e in (snap.get("objects") or {}).items():
+            objs[key] = {"seen": e.get("vision_pos_m") is not None,
+                         "camera_xyz_m": [round(v, 4) for v in e["vision_pos_m"]] if e.get("vision_pos_m") else None,
+                         "yaw_deg": None if e.get("yaw_deg") is None else round(e["yaw_deg"], 1),
+                         "score_error_mm": None if e.get("delta_mm") is None else round(e["delta_mm"], 1)}
+        _perception_log_id += 1
+        perception_log.append({"id": _perception_log_id, "t": time.strftime("%H:%M:%S"), "event": event,
+                               "note": note, "objects": objs, "jpeg": enc.tobytes()})
+    except Exception as e:
+        print(f"[Perception] log_perception_event failed (non-fatal): {e}", flush=True)
+
+
+def telemetry_object_view():
+    """Objects as the rest of the system (orchestrator, Nemotron prompt, guardrails) is allowed
+    to see them. Pure mode: only what the camera currently localizes — anything not seen is
+    absent. Otherwise: simulator ground truth, as before."""
+    if perception_provider.mode == "pure":
+        view = {}
+        snap_objects = perception_provider.snapshot().get("objects", {})
+        for key, info in SCENE_OBJECTS.items():
+            entry = snap_objects.get(key)
+            if entry and entry.get("vision_pos_m") is not None:
+                view[key] = {"name": info["name"], "position": np.round(entry["vision_pos_m"], 4).tolist(),
+                             "source": "camera"}
+        for key in perception_provider.fixed_poses:
+            view[key] = {"name": SCENE_OBJECTS[key]["name"],
+                         "position": np.round(perception_provider.fixed_poses[key], 4).tolist(),
+                         "source": "fixed calibration"}
+        return view
+    return {key: {"name": info["name"], "position": np.round(get_live_object_pos(key), 4).tolist()}
+            for key, info in SCENE_OBJECTS.items()}
 
 rp_wrist = rep.create.render_product("/World/Franka/panda_hand/WristCamera", (960, 540))
 wrist_annot = rep.AnnotatorRegistry.get_annotator("rgb")
@@ -788,7 +837,7 @@ _next_request_id = 0
 
 # Emergency stop — set by the /hard_stop route (GUI's red "Hard Reset" button). Checked at
 # the very top of the sim loop every frame, so it preempts whatever's in progress (a
-# mid-motion pick_place, an in-flight VLA chunk, or anything still sitting in the queue)
+# mid-motion pick_place, or anything still sitting in the queue)
 # instead of waiting for the current task to finish on its own. Drops the queue/plan, homes
 # the arm, AND resets every cube to its default staging spot — a full known-good-state reset,
 # not just a motion abort.
@@ -812,9 +861,7 @@ def _new_request_id() -> int:
 
 latest_frames = {
     "scene_jpeg": None,
-    "front_jpeg": None,
-    "side_jpeg": None,
-    "top_jpeg": None,
+    "scene_raw_jpeg": None,   # overview frame WITHOUT the perception overlay (what Cosmos should see)
     "wrist_jpeg": None,
     "timestamp": 0.0
 }
@@ -838,6 +885,11 @@ sim_telemetry = {
     # task below; None until the first one finishes. No longer a hardcoded always-PASS stub.
     "last_task_success": None,
     "last_task_error_mm": None,
+    # Why the last task was REFUSED before it started (e.g. "there is no free spot on the table ..." or a target the
+    # camera cannot see) — a refusal that retrying cannot fix. The agent shows the text to Nemotron and does not
+    # blindly retry a refusal. Cleared at every dispatch.
+    "last_task_error": None,
+    "last_task_refused": False,
     # ID of the request currently being processed (see `_next_request_id` / command_queue
     # below) — set the moment it's dequeued, matching whatever /execute returned to the
     # caller that sent it. This is the only way a caller can unambiguously tell "the sim
@@ -847,10 +899,6 @@ sim_telemetry = {
     # separate real bugs this session, both from concurrent manual + orchestrated use of this
     # one shared command queue).
     "current_request_id": 0,
-    # Real GR00T VLA per-chunk summary (see the VLA control loop below) — None until the
-    # first "vla:"-prefixed task actually runs a chunk through the model.
-    "vla_reasoning": None,
-    "vla_chunks_done": 0,
     # Real grasp-confirmation (gripper's actual achieved width vs GRASP_MIN_WIDTH_M) and
     # object-displacement (did it move a meaningful amount at all) signals — closes a real
     # gap where position-only post-place verification couldn't tell "landed wrong" apart
@@ -870,8 +918,7 @@ telemetry_lock = threading.Lock()
 # end-effector frame.
 EE_OFFSET = np.array([0.0, 0.005, 0.0])
 CUBE_HALF_HEIGHT = 0.025
-# Shared post-place verification tolerances — used by both the deterministic
-# PickPlaceController path and the GR00T VLA path (see each's own verification block).
+# Post-place verification tolerances.
 # XY tolerance is half a cube width; Z gets a looser tolerance since a dropped/settled
 # cube can still be bouncing/rotating slightly when verification fires.
 POSITION_XY_TOLERANCE_M = 0.03
@@ -953,6 +1000,23 @@ def _find_object_mentions(inst: str):
     return mentions
 
 
+def _free_table_spot(moving_key: str, from_pos) -> np.ndarray:
+    """A free table spot for `moving_key` from the shared safe-zone search: inside the safe zone (not near the robot base, not
+    out of reach, not near the tray), clear of every other cube, and the cheapest carry from where the cube is now."""
+    others = []
+    for key in CUBE_OBJECTS:
+        if key == moving_key:
+            continue
+        try:
+            others.append(np.asarray(decision_pos(key), float)[:2])
+        except PerceptionUnavailable:
+            continue
+    spot = stack_rules.find_free_spot([tuple(o) for o in others], (float(from_pos[0]), float(from_pos[1])))
+    if spot is None:
+        raise RuntimeError("there is no free spot on the table with enough room around it to move it to")
+    return np.array(spot)
+
+
 def _pick_free_tray_slot(exclude_key: str) -> np.ndarray:
     """Returns the most-preferred tray slot not already occupied by another live cube —
     center first, then left, then right (see TRAY_SLOT_PREFERENCE)."""
@@ -960,7 +1024,10 @@ def _pick_free_tray_slot(exclude_key: str) -> np.ndarray:
     for key in CUBE_OBJECTS:
         if key == exclude_key:
             continue
-        pos = get_live_object_pos(key)
+        try:
+            pos = decision_pos(key)
+        except PerceptionUnavailable:
+            continue                               # camera does not see this cube: it cannot be occupying a slot
         if TRAY_X_BOUNDS[0] <= pos[0] <= TRAY_X_BOUNDS[1] and TRAY_Y_BOUNDS[0] <= pos[1] <= TRAY_Y_BOUNDS[1]:
             dists = [math.hypot(pos[0] - s[0], pos[1] - s[1]) for s in TRAY_SLOTS]
             nearest = int(np.argmin(dists))
@@ -1014,6 +1081,7 @@ def resolve_pick_place_targets(instruction: str):
         perception_provider.refresh(list(_perception_keys))
     except Exception as e:
         print(f"[Perception] Refresh failed (non-fatal, falling back to stage poses): {e}", flush=True)
+    log_perception_event("Pre-pick detection", f"Instruction: {instruction} — target {matched_target}")
 
     target_pos = perception_provider.get_object_pose(matched_target)
     tray_pos = perception_provider.get_object_pose("target_tray")
@@ -1087,6 +1155,11 @@ def resolve_pick_place_targets(instruction: str):
             placing_position = np.array([px, py, place_z])
         print(f"[Planner] '{target_name}' relative to '{SCENE_OBJECTS[reference_key]['name']}' "
               f"@ {np.round(ref_pos, 3)} (stack={is_stack}) -> place {np.round(placing_position, 3)}", flush=True)
+    elif any(k in inst for k in ("free spot", "clear spot", "empty spot", "on the table")):
+        # "Move it out of the way": any reachable table spot clear of every other cube (and the tray).
+        spot = _free_table_spot(matched_target, picking_position)
+        placing_position = np.array([spot[0], spot[1], CUBE_HALF_HEIGHT])
+        print(f"[Planner] '{target_name}' -> free table spot {np.round(spot, 3)}", flush=True)
     elif wants_tray:
         slot_xy = _pick_free_tray_slot(matched_target)
         placing_position = np.array([slot_xy[0], slot_xy[1], tray_pos[2] + TRAY_HALF_HEIGHT + CUBE_HALF_HEIGHT])
@@ -1112,63 +1185,6 @@ PICK_PLACE_EVENT_NAMES = {
     8: "Ascending",
     9: "Returning to Staging Position",
 }
-
-# ── 6.5. Real GR00T-N1.7 VLA Closed-Loop Client (Phase 3) ──────────────────────
-# GR00T's torch/transformers/flash-attn build only exists in Isaac-GR00T/.venv, not in Isaac
-# Sim's own bundled Python this file runs under — so real inference runs as a separate process
-# (groot_policy_service.py, port 8300) and this is an HTTP client of it, same pattern as the
-# Nemotron server. Real forward passes only: no keyword-matching fallback exists here.
-GROOT_SERVER_URL = "http://localhost:8300"
-VLA_ACTION_ORDER = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-# Fixed downward grasp orientation for state feedback — we don't have a real measured EE
-# orientation telemetry channel, so this constant matches the fixed DOWNWARD_ROT convention
-# every other part of the pipeline already assumes for a top-down grasp. VLA-predicted
-# roll/pitch/yaw deltas are intentionally NOT applied to arm orientation for this first
-# closed-loop pass — only xyz position + gripper are driven from the model, to avoid
-# compounding orientation error on top of an already-approximate state input.
-VLA_FIXED_RPY = np.array([3.14159, 0.0, 0.0], dtype=np.float32)
-# Workspace safety clamp — VLA position deltas accumulate every step; without bounds an
-# out-of-distribution prediction (this checkpoint isn't fine-tuned on our scene) could walk
-# the target outside the reachable workspace or into the table.
-VLA_XYZ_MIN = np.array([0.20, -0.45, 0.035], dtype=np.float32)
-VLA_XYZ_MAX = np.array([0.70, 0.45, 0.45], dtype=np.float32)
-# Same fixed downward end-effector orientation PickPlaceController itself defaults to
-# (euler_angles_to_quat([0, pi, 0])) — reused here for consistency, not re-derived.
-VLA_DOWNWARD_QUAT = euler_angles_to_quat(np.array([0, np.pi, 0]))
-VLA_HOLD_FRAMES = 15   # physics frames to hold/converge on each chunk step's target (~0.25s)
-VLA_MAX_CHUNKS = 4     # cap total re-queries per task so an out-of-distribution loop can't run forever
-
-
-def encode_frame_b64(raw_rgb: np.ndarray) -> str:
-    """JPEG-encodes a raw RGB annotator frame to a base64 string for the GR00T HTTP API."""
-    bgr = cv2.cvtColor(raw_rgb[:, :, :3], cv2.COLOR_RGB2BGR)
-    _, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return base64.b64encode(encoded.tobytes()).decode("ascii")
-
-
-def query_groot_server(instruction: str, scene_rgb: np.ndarray, wrist_rgb: np.ndarray,
-                        ee_xyz: np.ndarray, gripper_width: float):
-    """Calls the real GR00T-N1.7 policy server. Returns (horizon, 7) np.ndarray or None on error."""
-    ee_pose6 = [float(ee_xyz[0]), float(ee_xyz[1]), float(ee_xyz[2]),
-                float(VLA_FIXED_RPY[0]), float(VLA_FIXED_RPY[1]), float(VLA_FIXED_RPY[2])]
-    payload = jsonlib.dumps({
-        "instruction": instruction,
-        "scene_image_b64": encode_frame_b64(scene_rgb),
-        "wrist_image_b64": encode_frame_b64(wrist_rgb),
-        "ee_pose": ee_pose6,
-        "gripper_width": float(gripper_width),
-    }).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            f"{GROOT_SERVER_URL}/predict", data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
-            data = jsonlib.loads(resp.read().decode("utf-8"))
-            return np.array(data["action_chunk"], dtype=np.float32)
-    except Exception as e:
-        print(f"[GR00T VLA] Query failed: {e}", flush=True)
-        return None
 
 # ── 7. FastAPI App for Streaming & Control ─────────────────────────────────────
 api_app = FastAPI(title="Isaac Sim Franka Stream Service", version="2.0.0")
@@ -1201,16 +1217,13 @@ def root_index():
         <ul>
             <li><a href="/camera/stream" target="_blank">/camera/stream</a> — 3rd Person Isometric Overview</li>
             <li><a href="/camera/scene.stream" target="_blank">/camera/scene.stream</a> — 3rd Person Scene View</li>
-            <li><a href="/camera/front.stream" target="_blank">/camera/front.stream</a> — Front Operator View</li>
-            <li><a href="/camera/side.stream" target="_blank">/camera/side.stream</a> — Side Profile & Clearance View</li>
-            <li><a href="/camera/top.stream" target="_blank">/camera/top.stream</a> — Top-Down Bird's Eye View</li>
             <li><a href="/camera/wrist.stream" target="_blank">/camera/wrist.stream</a> — Wrist Camera (End-Effector)</li>
         </ul>
         <h3>📊 Telemetry & Control APIs</h3>
         <ul>
             <li><a href="/health" target="_blank">/health</a> — Service Health & Simulation State</li>
             <li><a href="/state" target="_blank">/state</a> — Live 7-DOF Joint Positions & FPS Telemetry</li>
-            <li><a href="/api/cameras" target="_blank">/api/cameras</a> — List of all 5 cameras</li>
+            <li><a href="/api/cameras" target="_blank">/api/cameras</a> — List of the 2 cameras (overview, wrist)</li>
             <li><a href="/api/lighting" target="_blank">/api/lighting</a> — List of all lighting presets</li>
         </ul>
     </div>
@@ -1224,7 +1237,7 @@ def health():
             "status": "ok",
             "busy": sim_telemetry["busy"],
             "stage": sim_telemetry["stage"],
-            "cameras": 5,
+            "cameras": 2,
             "lighting": current_lighting_preset
         }
 
@@ -1251,14 +1264,17 @@ def get_perception():
     real robot dispatch are unaffected by this in stage/shadow mode."""
     return JSONResponse(perception_provider.snapshot())
 
+@api_app.post("/background/rebuild")
+def rebuild_background():
+    """Hot-reloads factory_background.py and rebuilds the backdrop on the next sim frame (visual only)."""
+    background_rebuild_event.set()
+    return JSONResponse({"status": "requested"})
+
 @api_app.get("/api/cameras")
 def get_cameras():
     return {
         "cameras": [
             {"id": "scene", "name": "3rd Person Isometric Overview", "stream": "/camera/stream"},
-            {"id": "front", "name": "Front Operator View", "stream": "/camera/front.stream"},
-            {"id": "side", "name": "Side Profile & Height Clearance", "stream": "/camera/side.stream"},
-            {"id": "top", "name": "Top-Down Bird's Eye Planar", "stream": "/camera/top.stream"},
             {"id": "wrist", "name": "Wrist Camera (Gripper Close-up)", "stream": "/camera/wrist.stream"},
         ]
     }
@@ -1286,6 +1302,25 @@ async def change_lighting(req: Request):
     return {"status": "ok", "lighting": preset}
 
 # Single Snapshot JPEGs (HD 720p)
+@api_app.post("/perception/mode")
+async def set_perception_mode(req: Request):
+    """Live switch between the deterministic path and the perception path (the GUI's
+    "Drive arm from camera" switch). 'shadow' = simulator ground-truth poses drive the robot,
+    perception runs alongside and only logs a delta. 'vision' = the camera-derived poses drive
+    the robot (with the provider's sanity gate + automatic fallback to ground truth).
+    Takes effect on the very next dispatched pick/place — no restart."""
+    body = await req.json()
+    mode = body.get("mode")
+    if mode not in ("shadow", "vision", "pure"):
+        return JSONResponse({"error": "mode must be 'shadow', 'vision' or 'pure'"}, status_code=400)
+    if mode == "pure":
+        perception_provider.detector = "color"   # pure mode needs the fast local detector
+    perception_provider.mode = mode
+    print(f"[Perception] Mode switched to '{mode}' via API", flush=True)
+    _mode_switch_pending_log[0] = mode
+    # The sim loop (which owns the camera annotators) refreshes + logs on its next iteration.
+    return JSONResponse({"status": "ok", "mode": mode})
+
 @api_app.get("/camera/scene.jpg")
 def get_scene_jpeg():
     with frame_lock:
@@ -1293,25 +1328,26 @@ def get_scene_jpeg():
             return Response(content=latest_frames["scene_jpeg"], media_type="image/jpeg")
     return Response(status_code=404)
 
-@api_app.get("/camera/front.jpg")
-def get_front_jpeg():
+@api_app.get("/camera/scene_raw.jpg")
+def get_scene_raw_jpeg():
+    """Overview frame with no perception overlay — this is what the vision-language model (Cosmos)
+    is shown, so drawn boxes/labels can't bias what it 'sees'."""
     with frame_lock:
-        if latest_frames["front_jpeg"] is not None:
-            return Response(content=latest_frames["front_jpeg"], media_type="image/jpeg")
+        data = latest_frames["scene_raw_jpeg"] or latest_frames["scene_jpeg"]
+    if data is not None:
+        return Response(content=data, media_type="image/jpeg")
     return Response(status_code=404)
 
-@api_app.get("/camera/side.jpg")
-def get_side_jpeg():
-    with frame_lock:
-        if latest_frames["side_jpeg"] is not None:
-            return Response(content=latest_frames["side_jpeg"], media_type="image/jpeg")
-    return Response(status_code=404)
+@api_app.get("/perception/log")
+def get_perception_log():
+    """Newest-first perception events (no image bytes) — the Perception Log page reads this."""
+    return JSONResponse([{k: v for k, v in e.items() if k != "jpeg"} for e in reversed(list(perception_log))])
 
-@api_app.get("/camera/top.jpg")
-def get_top_jpeg():
-    with frame_lock:
-        if latest_frames["top_jpeg"] is not None:
-            return Response(content=latest_frames["top_jpeg"], media_type="image/jpeg")
+@api_app.get("/perception/log/{entry_id}.jpg")
+def get_perception_log_image(entry_id: int):
+    for e in list(perception_log):
+        if e["id"] == entry_id:
+            return Response(content=e["jpeg"], media_type="image/jpeg")
     return Response(status_code=404)
 
 @api_app.get("/camera/wrist.jpg")
@@ -1340,18 +1376,6 @@ def get_scene_stream():
 @api_app.get("/camera/scene.stream")
 def get_scene_stream_alias():
     return create_mjpeg_response("scene_jpeg")
-
-@api_app.get("/camera/front.stream")
-def get_front_stream():
-    return create_mjpeg_response("front_jpeg")
-
-@api_app.get("/camera/side.stream")
-def get_side_stream():
-    return create_mjpeg_response("side_jpeg")
-
-@api_app.get("/camera/top.stream")
-def get_top_stream():
-    return create_mjpeg_response("top_jpeg")
 
 @api_app.get("/camera/wrist.stream")
 def get_wrist_stream():
@@ -1386,7 +1410,7 @@ def randomize_cubes():
 @api_app.post("/hard_stop")
 def hard_stop():
     """Emergency stop for the GUI's red 'Hard Reset' button — abort whatever's running (a
-    mid-motion pick_place, an in-flight VLA chunk, anything still queued) and home the arm,
+    mid-motion pick_place, anything still queued) and home the arm,
     without touching cube positions. Just sets a flag + drains the queue; the actual abort
     happens synchronously at the top of the sim loop on its next frame (see hard_stop_event
     below) since only that thread may safely touch the robot/controller/USD stage."""
@@ -1409,89 +1433,126 @@ print("  📡 Live HD Camera Streams: http://localhost:8100/                ", f
 print("═══════════════════════════════════════════════════════════════════", flush=True)
 
 active_pick_place = None  # dict: {picking_position, placing_position, matched_target} or None
-active_vla = None  # dict: {instruction, chunk, step_idx, target_xyz} or None — Phase 3 GR00T loop
 last_fps_time = time.time()
 fps_counter = 0
 held_object_key = None
+_mode_switch_pending_log = [None]   # set by the API thread; the sim loop writes the log entry
+ENCODE_EVERY = max(1, int(os.environ.get("PHYSYK_ENCODE_EVERY", "2")))   # JPEG-encode the streams every Nth loop iteration
+_enc_iter = 0
+_last_live_perception = 0.0   # throttles the idle live-perception refresh in the loop below
 
 # Helper to encode with clean, subtle, anti-aliased HUD and rich color fidelity
-def encode_camera_frame(raw_rgb, label: str):
+# cv2.putText's Hershey fonts only draw ASCII — anything else (em dashes in the stage names, bullets,
+# arrows...) renders as "???". Everything drawn onto a frame goes through this first.
+_HUD_CHAR_MAP = str.maketrans({
+    "\u2014": "-", "\u2013": "-", "\u2022": "-", "\u00b7": "-", "\u2192": "->", "\u2190": "<-",
+    "\u2026": "...", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u00d7": "x",
+    "\u00b0": " deg", "\u2265": ">=", "\u2264": "<=", "\u2713": "OK", "\u00a0": " ",
+})
+
+
+def hud_text(value) -> str:
+    """ASCII-safe text for cv2.putText: common punctuation is mapped to ASCII equivalents, accents are
+    stripped, and anything that still can't be drawn is dropped rather than shown as '?'."""
+    import unicodedata
+    text = str(value).translate(_HUD_CHAR_MAP)
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+_OVERLAY_BGR = {"red_cube": (60, 60, 255), "green_cube": (90, 230, 90), "blue_cube": (255, 170, 60),
+                "target_tray": (60, 220, 255)}
+
+
+_FIXED_EXTENTS = {"target_tray": (0.11, 0.12, 0.015)}   # half extents (m) of the tray FixedCuboid (scale 0.22 x 0.24 x 0.03)
+
+
+def draw_perception_overlay(bgr):
+    """Bounding boxes + camera-estimated XYZ for every object the color detector currently sees,
+    plus a banner naming which pose source is driving the arm. Drawn on the overview frame only."""
+    mode = perception_provider.mode
+    snap = perception_provider.snapshot()
+    banner = {"pure": "PERCEPTION: CAMERA ONLY", "vision": "PERCEPTION: CAMERA + SIM FALLBACK",
+              "shadow": "DETERMINISTIC (perception shadowing)", "stage": "DETERMINISTIC"}.get(mode, mode)
+    banner_color = (100, 235, 140) if mode == "pure" else (200, 200, 200)
+    cv2.putText(bgr, hud_text(banner), (14, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, banner_color, 1, cv2.LINE_AA)
+    items = []   # (key, padded box, label text)
+    for key, entry in (snap.get("objects") or {}).items():
+        box = entry.get("bbox_px")
+        pos = entry.get("vision_pos_m")
+        if not box or pos is None:
+            continue
+        x0, y0, x1, y1 = box
+        name = SCENE_OBJECTS[key]["name"].upper() if key in SCENE_OBJECTS else key
+        items.append((key, (x0 - 3, y0 - 3, x1 + 3, y1 + 3),
+                      hud_text(f"{name} ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")))
+    # Fixed-pose objects (the tray) are not detected, so they have no mask: draw the box of their known footprint.
+    from physyk_perception.deproject import project_world_to_pixel
+    for key, fp in perception_provider.fixed_poses.items():
+        info = SCENE_OBJECTS.get(key)
+        if info is None or key not in _FIXED_EXTENTS:
+            continue
+        hx, hy, hz = _FIXED_EXTENTS[key]
+        px = [project_world_to_pixel((fp[0] + dx, fp[1] + dy, fp[2] + dz), SCENE_CAM_INTRINSICS, SCENE_CAM_WORLD_TRANSFORM)
+              for dx in (-hx, hx) for dy in (-hy, hy) for dz in (-hz, hz)]
+        px = [p for p in px if p is not None]
+        if len(px) < 4:
+            continue
+        us, vs = [p[0] for p in px], [p[1] for p in px]
+        items.append((key, (int(min(us)) - 3, int(min(vs)) - 3, int(max(us)) + 3, int(max(vs)) + 3),
+                      hud_text(f"{info['name'].upper()} ({fp[0]:.2f}, {fp[1]:.2f}, {fp[2]:.2f}) FIXED")))
+    if not items:
+        return bgr
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, 0.38
+    sizes = []
+    for _, _, text in items:
+        (tw, th), base = cv2.getTextSize(text, font, scale, 1)
+        sizes.append((tw, th + base))
+    # Labels go in a column beside the cluster (stacked cubes' boxes nearly coincide, so a label
+    # above each box would collide); leader lines tie each one back to its box.
+    h_img, w_img = bgr.shape[:2]
+    placed = layout_labels([b for _, b, _ in items], sizes, w_img, h_img)
+    for (key, box, text), lay in zip(items, placed):
+        color = _OVERLAY_BGR.get(key, (255, 255, 255))
+        cv2.rectangle(bgr, (box[0], box[1]), (box[2], box[3]), color, 1, cv2.LINE_AA)
+        lx = lay["label_x"] - 3 if lay["side"] == "right" else lay["label_x"] + sizes[items.index((key, box, text))][0] + 3
+        cv2.line(bgr, lay["anchor"], (lx, lay["label_mid_y"]), color, 1, cv2.LINE_AA)
+        cv2.putText(bgr, text, lay["text_xy"], font, scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(bgr, text, lay["text_xy"], font, scale, color, 1, cv2.LINE_AA)
+    return bgr
+
+
+def encode_camera_frame(raw_rgb, label: str, overlay: bool = False):
     if raw_rgb is None or raw_rgb.size == 0:
         return None
     bgr = cv2.cvtColor(raw_rgb[:, :, :3], cv2.COLOR_RGB2BGR)
+    if overlay:
+        try:
+            bgr = draw_perception_overlay(bgr)
+        except Exception as e:   # a drawing bug must never take the camera stream down
+            print(f"[WARN] Perception overlay failed: {e}", flush=True)
     
     # Subtle, sleek, crisp watermark HUD
-    cv2.putText(bgr, f"PHYSYK • {label.upper()}", (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 240, 255), 1, cv2.LINE_AA)
+    cv2.putText(bgr, hud_text(f"PHYSYK - {label.upper()}"), (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (230, 240, 255), 1, cv2.LINE_AA)
     with telemetry_lock:
         st = sim_telemetry.get("stage", "READY")
     color = (100, 235, 140) if st == "READY" else (100, 200, 255)
-    cv2.putText(bgr, f"STAGE: {st}", (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
+    cv2.putText(bgr, hud_text(f"STAGE: {st}"), (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.46, color, 1, cv2.LINE_AA)
     
     # High-quality 90% JPEG encoding
     _, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return encoded.tobytes()
 
 
-def _verify_vla_task(instruction: str):
-    """Real post-place verification for a GR00T VLA-driven task — this used to not exist at
-    all: the VLA loop just ran its chunk budget and stopped, with no last_task_success/
-    last_task_error_mm ever computed, so there was no way to know whether GR00T actually
-    accomplished anything. Reuses the exact same resolution (resolve_pick_place_targets —
-    safe to call again, it's pure planning logic with no side effects of its own) and
-    tolerances (POSITION_XY/Z_TOLERANCE_M) the deterministic path already uses, so
-    VLA-driven and PickPlaceController-driven actions are judged by the same real standard,
-    not two different bars. This does not make GR00T reliable — it makes its real
-    (un)reliability observable, which it wasn't before."""
-    try:
-        matched_target, picking_pos, placing_position, target_name, _ref = \
-            resolve_pick_place_targets(instruction)
-    except Exception as e:
-        print(f"[GR00T VLA] Could not resolve a verification target for '{instruction}': {e}", flush=True)
-        with telemetry_lock:
-            sim_telemetry["last_task_success"] = None
-            sim_telemetry["last_task_error_mm"] = None
-        return
-    final_pos = get_live_object_pos(matched_target)
-    err_xy = float(np.hypot(final_pos[0] - placing_position[0], final_pos[1] - placing_position[1]))
-    err_z = float(abs(final_pos[2] - placing_position[2]))
-    position_ok = (err_xy <= POSITION_XY_TOLERANCE_M) and (err_z <= POSITION_Z_TOLERANCE_M)
-
-    # Same real "did it actually move" check as the deterministic path — VLA has no
-    # discrete grasp-close phase to hook a grasp-confirmation check onto the way
-    # PickPlaceController does, but this displacement check is free either way.
-    displacement_m = float(np.hypot(final_pos[0] - picking_pos[0], final_pos[1] - picking_pos[1]))
-    intended_displacement_m = float(np.hypot(placing_position[0] - picking_pos[0], placing_position[1] - picking_pos[1]))
-    moved_enough = (intended_displacement_m < MEANINGFUL_DISPLACEMENT_M) or \
-        (displacement_m >= MEANINGFUL_DISPLACEMENT_M * 0.5)
-    task_success = position_ok and moved_enough
-
-    with telemetry_lock:
-        sim_telemetry["last_task_success"] = task_success
-        sim_telemetry["last_task_error_mm"] = round(err_xy * 1000.0, 1)
-        sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1)
-    fail_reasons = []
-    if not position_ok:
-        fail_reasons.append(f"missed target by {err_xy * 1000:.1f}mm")
-    if not moved_enough:
-        fail_reasons.append(f"barely moved ({displacement_m * 1000:.1f}mm, expected ~{intended_displacement_m * 1000:.1f}mm)")
-    print(
-        f"[GR00T VLA] Task Verification: {'PASS' if task_success else 'FAIL'} — "
-        f"'{target_name}' landed {err_xy * 1000:.1f}mm (xy) / {err_z * 1000:.1f}mm (z) "
-        f"from resolved target {np.round(placing_position, 3)} (actual {np.round(final_pos, 3)})"
-        + (f" — {'; '.join(fail_reasons)}" if fail_reasons else ""), flush=True
-    )
-
 try:
     while simulation_app.is_running():
         # -1. Emergency Hard Stop — pre-empts everything else this frame. Aborts whatever
-        #     task is active (pick_place or VLA), drops it without finishing its motion,
+        #     task is active, drops it without finishing its motion,
         #     opens the gripper, sends the arm home, AND returns every cube to its default
         #     staging spot — the button is meant as a full "get back to a known-good state"
         #     reset, not just a motion abort.
         if hard_stop_event.is_set():
             hard_stop_event.clear()
             active_pick_place = None
-            active_vla = None
             held_object_key = None
             _drain_command_queue()  # catches anything queued between /hard_stop and this frame
             with telemetry_lock:
@@ -1505,10 +1566,18 @@ try:
                 sim_telemetry["stage"] = "READY"
                 sim_telemetry["last_instruction"] = "Hard reset — ready for new commands"
                 sim_telemetry["current_request_id"] = 0
-                sim_telemetry["vla_reasoning"] = None
-                sim_telemetry["vla_chunks_done"] = 0
             print("[Isaac Sim Service] HARD STOP — task aborted, arm homed, cubes reset to default.", flush=True)
             continue
+
+        # 0.0 Rebuild the visual backdrop on request (hot reload of factory_background.py; no physics involved)
+        if background_rebuild_event.is_set():
+            background_rebuild_event.clear()
+            try:
+                import importlib
+                importlib.reload(factory_background)
+                factory_background.build(stage)
+            except Exception as e:
+                print(f"[WARN] Background rebuild failed: {e}", flush=True)
 
         # 0. Process Dynamic Lighting Updates
         if not lighting_queue.empty():
@@ -1516,12 +1585,14 @@ try:
             set_lighting_preset(preset_name)
 
         # 1. Process Pending Commands
-        if active_pick_place is None and active_vla is None and not command_queue.empty():
+        if active_pick_place is None and not command_queue.empty():
             req_id, cmd = command_queue.get_nowait()
             with telemetry_lock:
                 sim_telemetry["busy"] = True
                 sim_telemetry["last_instruction"] = cmd
                 sim_telemetry["current_request_id"] = req_id
+                sim_telemetry["last_task_error"] = None
+                sim_telemetry["last_task_refused"] = False
 
             if "reset" in cmd:
                 # Full reset: cubes back to fixed staging spots AND robot home. Distinct from
@@ -1537,8 +1608,6 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
             elif "home" in cmd:
                 # Robot only — cube positions are left exactly where they are.
                 with telemetry_lock:
@@ -1550,8 +1619,6 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
             elif "randomize" in cmd or "shuffle" in cmd or "random" in cmd:
                 with telemetry_lock:
                     sim_telemetry["stage"] = "RANDOMIZING CUBE POSITIONS"
@@ -1559,21 +1626,9 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
-            elif cmd.strip().lower().startswith("vla:") or cmd.strip().lower().startswith("vla "):
-                # Real GR00T-N1.7 closed-loop mode — separate from the reliable
-                # PickPlaceController path above, opt-in via a "vla:" prefix so the default
-                # instruction path stays on the validated, deterministic controller.
-                vla_instruction = cmd.split(":", 1)[-1].strip() if ":" in cmd else cmd[4:].strip()
-                active_vla = {"instruction": vla_instruction, "chunk": None, "step_idx": 0}
-                with telemetry_lock:
-                    sim_telemetry["stage"] = f"GR00T VLA — Querying Model"
             else:
                 with telemetry_lock:
                     sim_telemetry["stage"] = "ASSESSING SCENE"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
                 try:
                     # Perception grounding + (in vision mode) actually driving target_pos/
                     # tray_pos/ref_pos now happens INSIDE resolve_pick_place_targets itself
@@ -1614,10 +1669,15 @@ try:
                         "reference_key": reference_key,
                         "grasp_checked": False,
                     }
-                    episode_recorder.start_episode(cmd)
                 except Exception as e:
                     print(f"[Planner Error] {e}", flush=True)
                     with telemetry_lock:
+                        sim_telemetry["last_task_error"] = str(e)
+                        sim_telemetry["last_task_refused"] = True
+                        # A task that never started must not leave the PREVIOUS task's success
+                        # flag standing (e.g. pure mode: target not visible to the camera).
+                        sim_telemetry["last_task_success"] = False
+                        sim_telemetry["last_task_error_mm"] = None
                         sim_telemetry["busy"] = False
                         sim_telemetry["stage"] = "READY"
 
@@ -1676,14 +1736,17 @@ try:
                     # also shows a physically-consistent open gripper, not a stale closed one.
                     robot.gripper.open()
                     pick_place_controller.reset()
-                    final_pos = get_live_object_pos(active_pick_place["matched_target"])
                     start_pos = active_pick_place["picking_position"]
-                    displacement_m = float(np.hypot(final_pos[0] - start_pos[0], final_pos[1] - start_pos[1]))
+                    try:
+                        final_pos = fresh_decision_pos(active_pick_place["matched_target"])
+                        displacement_m = float(np.hypot(final_pos[0] - start_pos[0], final_pos[1] - start_pos[1]))
+                    except PerceptionUnavailable:
+                        displacement_m = None
                     with telemetry_lock:
                         sim_telemetry["last_task_success"] = False
                         sim_telemetry["last_task_error_mm"] = None
-                        sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1)
-                    episode_recorder.end_episode(False)  # early grasp-fail abort — drop the episode
+                        sim_telemetry["last_object_displacement_mm"] = (
+                            round(displacement_m * 1000.0, 1) if displacement_m is not None else None)
                     try:
                         rmpflow_motion_policy.enable_obstacle(CUBE_OBJECTS[active_pick_place["matched_target"]])
                         ref_key = active_pick_place.get("reference_key")
@@ -1698,11 +1761,6 @@ try:
                         sim_telemetry["stage"] = "READY"
             elif event_idx == 7:
                 held_object_key = None
-
-        # Captured before this block can clear active_pick_place back to None below, so the
-        # episode recorder's per-frame tap (in section 4, after raw camera frames are
-        # captured) knows whether a pick_place task was actually running this frame.
-        _recording_active_this_frame = active_pick_place is not None
 
         if active_pick_place is not None:
             current_joint_positions = robot.get_joint_positions()
@@ -1721,9 +1779,19 @@ try:
                 # the resolved placing_position it was sent to. XY tolerance is half a cube
                 # width; Z gets a looser tolerance since a dropped/settled cube can still be
                 # bouncing/rotating slightly when this fires.
-                final_pos = get_live_object_pos(active_pick_place["matched_target"])
                 target_pos = active_pick_place["placing_position"]
                 start_pos = active_pick_place["picking_position"]
+                try:
+                    # Deterministic mode: the stage's true pose. Pure mode: a fresh look through
+                    # the overview camera — the check is made by seeing where the cube ended up.
+                    final_pos = fresh_decision_pos(active_pick_place["matched_target"])
+                except PerceptionUnavailable:
+                    # Can't see the cube after the place (occluded/knocked out of view): success
+                    # cannot be established by looking, so it is NOT claimed.
+                    final_pos = np.array([np.nan, np.nan, np.nan])
+                log_perception_event("Post-place verification",
+                                     f"{active_pick_place['target_name']}: intended {np.round(target_pos, 3).tolist()}, "
+                                     f"seen at {np.round(final_pos, 3).tolist()}")
                 err_xy = float(np.hypot(final_pos[0] - target_pos[0], final_pos[1] - target_pos[1]))
                 err_z = float(abs(final_pos[2] - target_pos[2]))
                 position_ok = (err_xy <= POSITION_XY_TOLERANCE_M) and (err_z <= POSITION_Z_TOLERANCE_M)
@@ -1745,11 +1813,8 @@ try:
 
                 with telemetry_lock:
                     sim_telemetry["last_task_success"] = task_success
-                    sim_telemetry["last_task_error_mm"] = round(err_xy * 1000.0, 1)
-                    sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1)
-                # Flush (on success) or drop (on failure) the just-finished episode, using
-                # Physyk's own real verification above as the ground-truth label.
-                episode_recorder.end_episode(task_success)
+                    sim_telemetry["last_task_error_mm"] = round(err_xy * 1000.0, 1) if np.isfinite(err_xy) else None
+                    sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1) if np.isfinite(displacement_m) else None
                 fail_reasons = []
                 if not position_ok:
                     fail_reasons.append(f"missed target by {err_xy * 1000:.1f}mm")
@@ -1779,142 +1844,32 @@ try:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
 
-        # 2.5. Advance the real GR00T-N1.7 closed-loop VLA control mode (Phase 3). Observe
-        #      (live camera + EE pose) -> real model forward pass -> 16-step delta chunk ->
-        #      drive the arm through RMPFlow one delta-step at a time, re-observing every
-        #      chunk. Genuinely separate code path from the PickPlaceController above — no
-        #      keyword matching, no scripted waypoints; whatever xyz it predicts is what
-        #      drives the arm (gripper too, clamped to a safe range).
-        if active_vla is not None:
-            if active_vla["chunk"] is None:
-                if active_vla.get("chunks_done", 0) >= VLA_MAX_CHUNKS:
-                    print(f"[GR00T VLA] Reached max chunk budget ({VLA_MAX_CHUNKS}) — ending task.", flush=True)
-                    _verify_vla_task(active_vla["instruction"])
-                    active_vla = None
-                    with telemetry_lock:
-                        sim_telemetry["busy"] = False
-                        sim_telemetry["stage"] = "READY"
-                else:
-                    with telemetry_lock:
-                        sim_telemetry["stage"] = f"GR00T VLA — Querying Model ({active_vla['instruction']})"
-                    scene_rgb = scene_annot.get_data()
-                    wrist_rgb = wrist_annot.get_data()
-                    ee_xyz = get_end_effector_pos()
-                    dofs = robot.get_joint_positions()
-                    if dofs is not None and dofs.ndim > 1:
-                        dofs = dofs.flatten()
-                    gripper_width = float(dofs[7] * 2.0) if dofs is not None and len(dofs) > 7 else 0.04
-                    chunk = None
-                    if scene_rgb is not None and scene_rgb.size > 0 and wrist_rgb is not None and wrist_rgb.size > 0:
-                        chunk = query_groot_server(active_vla["instruction"], scene_rgb, wrist_rgb, ee_xyz, gripper_width)
-                    if chunk is None:
-                        print("[GR00T VLA] No usable chunk (camera not ready or server error) — ending task.", flush=True)
-                        # Only verify if at least one chunk actually ran — with zero real
-                        # motion attempted, there's nothing meaningful to check yet.
-                        if active_vla.get("chunks_done", 0) > 0:
-                            _verify_vla_task(active_vla["instruction"])
-                        active_vla = None
-                        with telemetry_lock:
-                            sim_telemetry["busy"] = False
-                            sim_telemetry["stage"] = "READY"
-                    else:
-                        active_vla["chunk"] = chunk
-                        active_vla["step_idx"] = 0
-                        active_vla["hold_counter"] = 0
-                        active_vla["target_xyz"] = ee_xyz.astype(np.float32).copy()
-                        active_vla["gripper_target"] = gripper_width
-                        active_vla["chunks_done"] = active_vla.get("chunks_done", 0) + 1
-                        # GR00T is a DiT action head, not a language model — it has no natural-
-                        # language "reasoning" to show. This is the honest substitute: a real
-                        # summary of what the model actually predicted for this chunk (net
-                        # displacement direction/magnitude + gripper intent), computed from the
-                        # real action_chunk tensor, not narration. Surfaced via /state so the UI
-                        # can show "what GR00T is doing" per chunk instead of a silent black box.
-                        net_xyz = chunk[:, :3].sum(axis=0)
-                        move_mag_cm = float(np.linalg.norm(net_xyz) * 100.0)
-                        move_dir = []
-                        if abs(net_xyz[0]) > 0.005: move_dir.append(("forward" if net_xyz[0] > 0 else "backward"))
-                        if abs(net_xyz[1]) > 0.005: move_dir.append(("left" if net_xyz[1] > 0 else "right"))
-                        if abs(net_xyz[2]) > 0.005: move_dir.append(("up" if net_xyz[2] > 0 else "down"))
-                        gripper_end = float(chunk[-1, 6])
-                        gripper_intent = "closing (grasp)" if gripper_end < gripper_width - 0.005 else (
-                            "opening (release)" if gripper_end > gripper_width + 0.005 else "holding")
-                        vla_reasoning = (
-                            f"Chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS}: predicted net move "
-                            f"{move_mag_cm:.1f}cm {'/'.join(move_dir) if move_dir else 'in place'}, "
-                            f"gripper {gripper_intent}."
-                        )
-                        with telemetry_lock:
-                            sim_telemetry["vla_reasoning"] = vla_reasoning
-                            sim_telemetry["vla_chunks_done"] = active_vla["chunks_done"]
-                        print(f"[GR00T VLA] Chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS} received, shape {chunk.shape} — {vla_reasoning}", flush=True)
-            else:
-                chunk = active_vla["chunk"]
-                idx = active_vla["step_idx"]
-                with telemetry_lock:
-                    sim_telemetry["stage"] = (
-                        f"GR00T VLA — Step {idx + 1}/{len(chunk)} "
-                        f"(chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS}) — {active_vla['instruction']}"
-                    )
-
-                if active_vla["hold_counter"] == 0:
-                    delta = chunk[idx]  # order: x, y, z, roll, pitch, yaw, gripper (see VLA_ACTION_ORDER)
-                    new_target = active_vla["target_xyz"] + delta[:3]
-                    active_vla["target_xyz"] = np.clip(new_target, VLA_XYZ_MIN, VLA_XYZ_MAX).astype(np.float32)
-                    active_vla["gripper_target"] = float(np.clip(delta[6], 0.0, 0.04))
-
-                cspace_actions = pick_place_controller._cspace_controller.forward(
-                    target_end_effector_position=active_vla["target_xyz"],
-                    target_end_effector_orientation=VLA_DOWNWARD_QUAT,
-                )
-                articulation_controller.apply_action(cspace_actions)
-                g = active_vla["gripper_target"]
-                robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([g, g], dtype=np.float32)))
-
-                active_vla["hold_counter"] += 1
-                if active_vla["hold_counter"] >= VLA_HOLD_FRAMES:
-                    active_vla["hold_counter"] = 0
-                    active_vla["step_idx"] += 1
-                    if active_vla["step_idx"] >= len(chunk):
-                        active_vla["chunk"] = None  # triggers a fresh observe+query next iteration
-
         # 3. Step PhysX Simulation & Rendering
         world.step(render=True)
         fps_counter += 1
         
-        # 4. Capture & Encode All 5 Camera Annotators
-        rep.orchestrator.step()
-        
-        raw_scene = scene_annot.get_data()
-        raw_front = front_annot.get_data()
-        raw_side = side_annot.get_data()
-        raw_top = top_annot.get_data()
-        raw_wrist = wrist_annot.get_data()
+        # 4. Capture & Encode the Camera Annotators (overview + wrist)
+        #    world.step(render=True) above already rendered and filled the annotators. A second rep.orchestrator.step() here
+        #    used to render every camera AGAIN for the same frame (measured on the master branch: ~7 -> ~32 iterations/s
+        #    without it, identical picks, fresh frames). The controller counts iterations, not wall time, so a faster
+        #    loop finishes the same motion sooner without changing it.
+        #    The JPEG streams only need about half the loop rate: reading the annotators and encoding every Nth iteration
+        #    (PHYSYK_ENCODE_EVERY, default 2) frees time for physics steps. Perception reads its own frames on demand.
+        _enc_iter += 1
+        if _enc_iter % ENCODE_EVERY == 0:
+            raw_scene = scene_annot.get_data()
+            raw_wrist = wrist_annot.get_data()
 
-        # GR00T fine-tuning episode recorder tap — no-op unless RECORD_EPISODES=1 (see top of
-        # file). Uses the same raw (pre-HUD-overlay) frames as the JPEG/stream encoding below,
-        # and current live EE/gripper state, without altering anything else in this section.
-        if _recording_active_this_frame and raw_scene is not None and raw_scene.size > 0 \
-                and raw_wrist is not None and raw_wrist.size > 0:
-            _dofs_for_recording = robot.get_joint_positions()
-            if _dofs_for_recording is not None and _dofs_for_recording.ndim > 1:
-                _dofs_for_recording = _dofs_for_recording.flatten()
-            _gripper_w = float(_dofs_for_recording[7] * 2.0) if _dofs_for_recording is not None and len(_dofs_for_recording) > 7 else 0.04
-            episode_recorder.log_frame(raw_scene, raw_wrist, get_end_effector_pos(), _gripper_w)
+            _pure = perception_provider.mode == "pure"
+            f_scene = encode_camera_frame(raw_scene, "Isometric Overview", overlay=_pure)
+            f_scene_raw = encode_camera_frame(raw_scene, "Isometric Overview") if _pure else f_scene
+            f_wrist = encode_camera_frame(raw_wrist, "Wrist Gripper")
 
-        f_scene = encode_camera_frame(raw_scene, "Isometric Overview")
-        f_front = encode_camera_frame(raw_front, "Front View")
-        f_side = encode_camera_frame(raw_side, "Side Profile")
-        f_top = encode_camera_frame(raw_top, "Top-Down")
-        f_wrist = encode_camera_frame(raw_wrist, "Wrist Gripper")
-        
-        with frame_lock:
-            if f_scene: latest_frames["scene_jpeg"] = f_scene
-            if f_front: latest_frames["front_jpeg"] = f_front
-            if f_side: latest_frames["side_jpeg"] = f_side
-            if f_top: latest_frames["top_jpeg"] = f_top
-            if f_wrist: latest_frames["wrist_jpeg"] = f_wrist
-            latest_frames["timestamp"] = time.time()
+            with frame_lock:
+                if f_scene: latest_frames["scene_jpeg"] = f_scene
+                if f_scene_raw: latest_frames["scene_raw_jpeg"] = f_scene_raw
+                if f_wrist: latest_frames["wrist_jpeg"] = f_wrist
+                latest_frames["timestamp"] = time.time()
 
         # 5. Update Telemetry
         if fps_counter % 5 == 0:
@@ -1923,10 +1878,7 @@ try:
                 if dofs.ndim > 1:
                     dofs = dofs.flatten()
                 ee_pos = get_end_effector_pos()
-                live_objects = {
-                    key: {"name": info["name"], "position": np.round(get_live_object_pos(key), 4).tolist()}
-                    for key, info in SCENE_OBJECTS.items()
-                }
+                live_objects = telemetry_object_view()
                 with telemetry_lock:
                     sim_telemetry["joints"] = np.round(dofs[:7], 4).tolist()
                     sim_telemetry["gripper"] = float(np.round(dofs[7], 4)) if len(dofs) > 7 else 0.04
@@ -1951,6 +1903,27 @@ try:
                     perception_camera_state["depth_max_m"] = float(finite.max()) if finite.size else None
                     perception_camera_state["depth_center_m"] = float(depth_frame[cy, cx])
                     perception_camera_state["timestamp"] = time.time()
+
+            if _mode_switch_pending_log[0] is not None:
+                _new_mode, _mode_switch_pending_log[0] = _mode_switch_pending_log[0], None
+                try:
+                    perception_provider.refresh(list(_PERCEPTION_LABEL_MAP))
+                except Exception as e:
+                    print(f"[Perception] Refresh after mode switch failed (non-fatal): {e}", flush=True)
+                log_perception_event(f"Mode switched to {_new_mode}", "Initial camera detection after the switch")
+                _last_live_perception = time.time()
+
+            # Live perception readout: in pure mode, re-localize the cubes from the camera every
+            # 0.5-1 s (colour detector only, a few ms) so /state and the overlay follow the scene.
+            # With the switch off nothing extra runs.
+            _live_period = 1.0 if sim_telemetry["busy"] else 0.5
+            if (perception_provider.mode == "pure" and perception_provider.detector == "color"
+                    and time.time() - _last_live_perception >= _live_period):
+                _last_live_perception = time.time()
+                try:
+                    perception_provider.refresh(list(_PERCEPTION_LABEL_MAP))
+                except Exception as e:
+                    print(f"[Perception] Live refresh failed (non-fatal): {e}", flush=True)
 
         # Calculate real FPS
         now = time.time()

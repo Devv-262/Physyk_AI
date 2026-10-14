@@ -10,6 +10,7 @@ frame, with real pixel-error measurements both times.
 import base64
 import io
 import json
+import os
 import re
 import time
 import urllib.request
@@ -18,7 +19,8 @@ import urllib.error
 import numpy as np
 from PIL import Image
 
-COSMOS_URL = "http://localhost:8001/v1/chat/completions"
+COSMOS_URL = "http://localhost:8001/v1/chat/completions"   # the local Cosmos 3 NIM (start_cosmos_docker.sh)
+COSMOS_MODEL = os.environ.get("COSMOS_MODEL", "nvidia/cosmos3-nano-reasoner")
 DEFAULT_TIMEOUT_S = 6.0  # per cosmos_integration.md's own guard rail for shadow/vision mode
 
 
@@ -35,7 +37,7 @@ def _post_chat(image_b64: str, mime: str, prompt: str, timeout: float):
     connection refused, malformed response) comes back as a non-None error string instead,
     so callers can degrade gracefully rather than needing their own try/except around this."""
     payload = {
-        "model": "nvidia/Cosmos-Reason2-2B",
+        "model": COSMOS_MODEL,
         "messages": [{
             "role": "user",
             "content": [
@@ -115,7 +117,7 @@ def ground_objects(rgb: np.ndarray, labels: list, timeout: float = DEFAULT_TIMEO
         f"visible. Example: " + json.dumps({labels[0]: [500, 500]}) if labels else "{}"
     )
     payload = {
-        "model": "nvidia/Cosmos-Reason2-2B",
+        "model": COSMOS_MODEL,
         "messages": [{
             "role": "user",
             "content": [
