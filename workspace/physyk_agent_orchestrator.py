@@ -1,36 +1,23 @@
 #!/usr/bin/env python3
 """
-Physyk AI — Real Nemotron Agentic Orchestrator (Phase 5)
-==========================================================
-This used to be a rule-based string-matching task decomposer whose output was computed and
-then thrown away by physyk_main_server.py — the real dispatch happened via a separate direct
-call right after (see PLAN.md Part 2 / dev-progress.md). That's gone. This module now:
+Physyk AI — Nemotron agentic orchestrator
+==========================================
+Turns a free-form instruction into a verified sequence of pick-and-place calls:
 
-1. Calls the real Nemotron-30B server (nemotron_fastapi_server / vLLM OpenAI server, port
-   8000 — see start_nemotron.sh) to decompose a free-form instruction into an ordered list of
-   structured pick-and-place subgoals, grounded against the *live* scene state (real object
-   positions from isaac_sim_service.py's /state, not a hardcoded object list).
-2. Runs a real NeMo-style guardrail check (`PhysicalWorkspaceRails`) against each subgoal's
-   resolved target/destination before it is ever dispatched to the robot.
-3. Dispatches each subgoal, in order, as a plain-text instruction into the existing
-   `/execute` -> `resolve_pick_place_targets()` -> `PickPlaceController` pipeline on
-   isaac_sim_service.py (port 8100) — that pipeline is untouched; it's used as a tool/skill,
-   exactly as-is. Waits for the sim to go idle and reads back the real post-place verification
-   result (`last_task_success` / `last_task_error_mm`).
-4. On a verified failure, does NOT follow a fixed retry-then-give-up schedule. It asks
-   Nemotron to actually diagnose the failure (real error, live scene, what's already been
-   completed) and choose: retry as-is / replan just this step / replan the rest of the plan —
-   one LLM call per failure, not a separate call for the decision and the replan. A disturbance
-   to an already-completed placement (something knocked over mid-plan) is detected this way,
-   not hardcoded.
-5. After every subgoal reports DONE, runs one deterministic (code-only, no LLM) final check
-   that the original goal still holds — re-comparing each verified placement's position against
-   what it was at verification time, catching a later step disturbing an earlier one. Only
-   unconditional plan SUCCESS if that holds too.
+1. Plans the steps. "Stack the cubes" (no colours, no and/then) is planned in code from the live cube positions (easiest first);
+   anything else is decomposed by Nemotron (NVIDIA's hosted API, see physyk_config.py) into an ordered list of structured pick-and-place
+   subgoals grounded against the *live* scene from isaac_sim_service.py's /state.
+2. Runs a deterministic guardrail check (`PhysicalWorkspaceRails`) against each subgoal's target and destination before it is dispatched.
+3. Clears a blocking cube first when the target has another cube on top of it.
+4. Dispatches each subgoal as a plain-text instruction into the sim's `/execute` -> `resolve_pick_place_targets()` -> `PickPlaceController`
+   pipeline (port 8100), waits for the sim to go idle and reads back the real post-place verification (`last_task_success` /
+   `last_task_error_mm`).
+5. On a verified failure, asks Nemotron to diagnose it (real error, live scene, what is already done) and choose: retry as-is / replan this
+   step / replan the rest of the plan - one LLM call per failure. A refusal from the sim is reported verbatim and not retried.
+6. After every subgoal reports DONE, runs one deterministic final check that the original goal still holds.
 
-No local model is loaded in this module or its caller — everything here is a plain HTTP client
-of two already-running real servers, so this stays cheap to import from physyk_main_server.py
-(which runs under plain system python3, not a GPU-framework venv).
+No model is loaded in this module: everything here is a plain HTTP client of the Nemotron API, Isaac Sim and Cosmos, so it stays cheap to
+import from physyk_main_server.py.
 """
 
 import json
@@ -43,8 +30,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
 
 from physyk_perception import step_verifier
 from reasoning_dashboard import NEMOTRON_REASONING_LOG, COSMOS_REASONING_LOG
@@ -85,9 +70,7 @@ def _scene_is_camera_derived(scene) -> bool:
 
 
 # ─── Real NeMo Safety Guardrails ───────────────────────────────────────────────
-# Bounds match VLA_XYZ_MIN/MAX in isaac_sim_service.py — the same reachable-workspace clamp
-# already validated there for GR00T VLA safety, reused here per PLAN.md 5.2 rather than
-# re-derived, so both safety paths agree on what "reachable" means.
+# Bounds of the arm's validated reachable workspace (metres, robot base at the origin, table top at z = 0).
 
 @dataclass
 class PhysicalWorkspaceRails:
@@ -353,7 +336,6 @@ def _describe_scene(scene: Dict[str, Any]) -> str:
 # ─── Stack awareness (cubes) ─────────────────────────────────────────────────────────────────────────────────
 # A cube with another cube on top of it cannot be picked: the blocker has to be moved off first. Positions come from the
 # live scene (simulator coordinates, or the camera in pure-perception mode), so this works on whatever stacks exist NOW.
-CUBE_SIZE_M = 0.05
 STACK_XY_M = 0.035                 # |dxy| below this = the other cube sits on this one
 STACK_MIN_DZ_M = 0.035             # ...and is at least this much higher (a full layer is 0.05)
 FREE_SPOT_DESTINATION = "on a free spot on the table"
@@ -794,19 +776,6 @@ Live scene objects (including where the target object actually ended up):
 {scene_desc}
 """
 
-REFUSAL_PROMPT_BLOCK = """
-IMPORTANT — THIS WAS A REFUSAL, NOT A MISS. The robot did not move: its own collision planner refused the step, \
-with this exact message:
-  "{refusal}"
-Trying the same thing again cannot work (it fails the same way every time), so "retry" is NOT an option here — \
-answering "retry" means "give up on this step". You may propose exactly ONE alternative, and it must be a \
-DIFFERENT action from the refused one:
-  - "replan_step" with a different destination; or
-  - "replan_remaining" whose FIRST subgoal moves the blocker named in the message out of the way, followed by \
-the refused step and whatever else is still needed.
-Never repeat the refused subgoal unchanged, and never invent an object.
-"""
-
 _VALID_DECISIONS = {"retry", "replan_step", "replan_remaining"}
 
 
@@ -851,7 +820,6 @@ def request_failure_decision(
     remaining_subgoals: List[Dict[str, Any]],
     scene: Dict[str, Any],
     error_mm: Any,
-    refusal: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Asks Nemotron to actually diagnose a real, verified placement failure and choose how to
     respond — retry as-is, replan just this step, or replan the rest of the plan — rather than
@@ -867,8 +835,6 @@ def request_failure_decision(
         .replace("{error_mm}", str(error_mm))
         .replace("{scene_desc}", _describe_scene(scene))
     )
-    if refusal:
-        prompt += REFUSAL_PROMPT_BLOCK.replace("{refusal}", refusal)
     payload = {
         "model": cfg.NEMOTRON_MODEL,
         "messages": [
@@ -946,15 +912,10 @@ def subgoal_to_instruction(subgoal: Dict[str, Any]) -> str:
 # ─── Orchestrator: Guardrails + Dispatch + Feedback Loop ──────────────────────
 
 # ─── Refusals and the final answer ──────────────────────────────────────────────────────────────────────────
-# The sim REFUSES a step it cannot do safely (no collision-free grasp, no free spot to place it) and says why in
+# The sim REFUSES a step it cannot do (no reachable grasp, no free spot to place it) and says why in
 # /state: last_task_refused / last_task_error. A refusal is deterministic — the same step fails the same way — so it
-# is never retried; Nemotron may propose ONE different alternative, and the plan carries on with the other steps.
-
-def _step_signature(sg: Dict[str, Any]) -> tuple:
-    """What makes two pick_place subgoals 'the same action' (same object to the same kind of place)."""
-    target = re.sub(r"^(?:the|a|an)\s+", "", (sg.get("target") or "").lower().strip())
-    return (target, (sg.get("destination") or "").lower().strip())
-
+# is never retried and no substitute action is made: the step FAILS with the sim's reason quoted verbatim, and the plan carries on with
+# the steps that do not depend on it.
 
 def build_outcome_summary(results: List[Dict[str, Any]], refusal_log: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Deterministic placed / not-placed account of a run, built from the per-step results. Refusal texts are kept
@@ -1199,47 +1160,6 @@ class NeMoRoboticsAgent:
             log.warning(f"[Cosmos] Pre-dispatch assessment failed unexpectedly (non-fatal): {e}")
             step["cosmos_assessment"] = {"error": f"NOT CHECKED (internal error: {e})"}
 
-    @staticmethod
-    def _alt_target_allowed(alt_target: str, refused_target: str, refusal: str) -> bool:
-        """After a refusal the model may only (a) try the SAME object differently or (b) move an object the refusal
-        names as the blocker. Anything else is an unrequested task and is rejected."""
-        a, r, txt = (alt_target or "").lower().strip(), (refused_target or "").lower().strip(), (refusal or "").lower()
-        if not a:
-            return False
-        return a in r or r in a or a in txt
-
-    def _refusal_alternative(self, decision: Optional[Dict[str, Any]], refused_signatures: set,
-                             scene: Dict[str, Any], remaining_replanned: bool,
-                             refused_target: str = "", refusal: str = ""):
-        """The one alternative Nemotron may offer after a refusal: ("replan_step", subgoal) or
-        ("replan_remaining", [subgoals]). Accepted only if it is a DIFFERENT action from every refused one and its
-        first subgoal passes the guardrail. 'retry' (or nothing usable) means: leave the step refused."""
-        if not decision:
-            return None
-        choice = decision.get("decision")
-        if choice == "replan_step":
-            cand = decision.get("subgoal")
-            candidates = [cand] if cand else []
-        elif choice == "replan_remaining" and not remaining_replanned:
-            candidates = decision.get("subgoals") or []
-        else:
-            return None
-        if not candidates:
-            return None
-        first = candidates[0]
-        if first.get("action") == "pick_place" and not self._alt_target_allowed(first.get("target", ""), refused_target, refusal):
-            log.warning(f"Refusal alternative rejected: it is about {first.get('target')!r}, not the refused "
-                        f"{refused_target!r} or the object named as the blocker — that would be an unrequested task.")
-            return None
-        if first.get("action") == "pick_place" and _step_signature(first) in refused_signatures:
-            log.warning(f"Refusal alternative rejected: it repeats the refused step ({first}).")
-            return None
-        ok, why = self.validate_subgoal(first, scene)
-        if not ok:
-            log.warning(f"Refusal alternative rejected by the guardrail ({why}).")
-            return None
-        return (choice, cand if choice == "replan_step" else candidates)
-
     def _dispatch(self, instruction: str) -> bool:
         """Posts the instruction, then blocks until Isaac Sim's own physics loop has actually
         picked up *this specific* dispatch — confirmed via `current_request_id`, a per-request
@@ -1368,7 +1288,6 @@ class NeMoRoboticsAgent:
         results = []
         completed_subgoals: List[Dict[str, Any]] = []
         remaining_replanned = False  # replan_remaining allowed once per run — safety valve
-        refused_signatures: set = set()   # actions the sim has refused this run — never proposed again
         refused_keys: set = set()         # objects the sim refused to move: later steps that depend on them are skipped
         refusal_log: List[Dict[str, Any]] = []   # every refusal this run, verbatim, attributed to the object it was about
         aborted = False  # set by a hard-stop request — short-circuits straight to ABORTED,
@@ -1591,7 +1510,6 @@ class NeMoRoboticsAgent:
                     step.setdefault("refusals", []).append(refusal)
                     refusal_log.append({"object": subgoal.get("target", "?"), "wanted": subgoal.get("destination") or "",
                                         "text": refusal})
-                    refused_signatures.add(_step_signature(subgoal))
                     _log(f"Step {i} REFUSED by the robot: \"{refusal}\"", "WARN")
                     step.update(status="REPLANNING", detail=f"refused by the robot: {refusal}")
                     # Policy (user decision): after a refusal the step simply FAILS, with the robot's reason shown. No

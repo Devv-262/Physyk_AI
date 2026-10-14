@@ -1,39 +1,22 @@
 #!/usr/bin/env python3
 """
-Physyk AI — Real Isaac Sim 6.0.1 Simulation & Multi-Camera Streaming Service
-=============================================================================
-- Franka Panda 9-DOF physics articulation in PhysX (60 Hz)
-- Native NVIDIA Lula Inverse Kinematics Engine with Accurate 0.0584m Fingertip TCP Offset
-- Static Unmovable Table & Tray (FixedCuboid)
-- Separated Object Staging & Instant Object Reset on Table
-- Calibrated 0.40 kg Rigid Cube Physics & Static Contacts
-- HD 720p Multi-Perspective Cameras with Optimal Cinematic Framing
-- Real-Time Calibrated Studio Lighting Controller
-- High-Performance Zero-Lag MJPEG Video Streaming on port 8100
+Physyk AI — Isaac Sim 6.0.1 simulation service
+===============================================
+- Franka Panda 9-DOF articulation in PhysX (60 Hz), driven by NVIDIA's PickPlaceController (RMPFlow) with closed-loop additions
+- Static work table and tray, three dynamic cubes, a visual-only lab background
+- Two cameras (overview + wrist) streamed as MJPEG on port 8100, plus the camera-only perception provider
+- Real-time studio lighting presets, HTTP control / telemetry API (/execute, /state, /reset, /randomize, /hard_stop, /perception*)
 """
 
 import sys
 import os
 import time
 import math
-import base64
 import threading
 import queue
 import collections
-import urllib.request
-import urllib.error
-import json as jsonlib
 import cv2
-import re
 import numpy as np
-
-# GR00T fine-tuning episode recorder — no-op unless RECORD_EPISODES=1 is set in the
-# environment (see groot_episode_recorder.py). Purely additive: does not change any existing
-# control flow when disabled (the default).
-from groot_episode_recorder import EpisodeRecorder
-episode_recorder = EpisodeRecorder(
-    output_dir=os.environ.get("RECORD_EPISODES_DIR", "/workspace/finetune_data/raw_episodes")
-)
 
 # ── 1. Boot Isaac Sim SimulationApp ───────────────────────────────────────────
 from isaacsim import SimulationApp
@@ -51,20 +34,15 @@ sim_config = {
 simulation_app = SimulationApp(sim_config)
 
 # ── 2. Imports after SimulationApp ─────────────────────────────────────────────
-import carb
-from pxr import Usd, UsdGeom, Gf, UsdPhysics, UsdLux, Sdf, PhysxSchema, UsdShade
+from pxr import Usd, UsdGeom, Gf, UsdLux, PhysxSchema, UsdShade
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import FixedCuboid, DynamicCuboid, VisualCuboid
 from isaacsim.core.api.materials import PhysicsMaterial
-from isaacsim.core.prims import Articulation
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.storage.native import get_assets_root_path
-from isaacsim.robot_motion.motion_generation.interface_config_loader import load_supported_lula_kinematics_solver_config
-from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
 from isaacsim.robot.manipulators import SingleManipulator
 from isaacsim.robot.manipulators.grippers import ParallelGripper
-from isaacsim.core.utils.rotations import euler_angles_to_quat
 from isaacsim.robot.manipulators.examples.franka.controllers.pick_place_controller import PickPlaceController
 import omni.replicator.core as rep
 
@@ -866,11 +844,6 @@ try:
 except Exception as e:
     print(f"[WARN] Could not tune finger joint drive gains, using stock values: {e}", flush=True)
 
-# ── 4.5. Initialize NVIDIA Lula Kinematics Solver ──────────────────────────────
-print("[Isaac Sim Service] Initializing Native Lula Kinematics Solver for Franka...", flush=True)
-kinematics_config = load_supported_lula_kinematics_solver_config("Franka")
-lula_solver = LulaKinematicsSolver(**kinematics_config)
-
 # ── 4.6. NVIDIA's Validated Pick-Place Controller (RMPFlow cspace + gripper state machine) ──
 # Replaces our own hand-rolled waypoint-interpolation grasp logic, which repeated tuning
 # passes could not get to a reliable lift. PickPlaceController's cspace_controller is
@@ -975,7 +948,7 @@ _next_request_id = 0
 
 # Emergency stop — set by the /hard_stop route (GUI's red "Hard Reset" button). Checked at
 # the very top of the sim loop every frame, so it preempts whatever's in progress (a
-# mid-motion pick_place, an in-flight VLA chunk, or anything still sitting in the queue)
+# mid-motion pick_place, or anything still sitting in the queue)
 # instead of waiting for the current task to finish on its own. Drops the queue/plan, homes
 # the arm, AND resets every cube to its default staging spot — a full known-good-state reset,
 # not just a motion abort.
@@ -1036,10 +1009,6 @@ sim_telemetry = {
     # separate real bugs this session, both from concurrent manual + orchestrated use of this
     # one shared command queue).
     "current_request_id": 0,
-    # Real GR00T VLA per-chunk summary (see the VLA control loop below) — None until the
-    # first "vla:"-prefixed task actually runs a chunk through the model.
-    "vla_reasoning": None,
-    "vla_chunks_done": 0,
     # Real grasp-confirmation (gripper's actual achieved width vs GRASP_MIN_WIDTH_M) and
     # object-displacement (did it move a meaningful amount at all) signals — closes a real
     # gap where position-only post-place verification couldn't tell "landed wrong" apart
@@ -1069,7 +1038,6 @@ if os.environ.get("PHYSYK_JOINT_TRACE", "1") != "0":
                       + ",".join(f"cmd{i+1}" for i in range(7)) + "," + ",".join(f"qd{i+1}" for i in range(7)) + ","
                       + ",".join(f"err{i+1}" for i in range(7)) + ",ee_x,ee_y,ee_z,cube_x,cube_y,cube_z,hand_x,hand_y,hand_z\n")
 _trace_t0 = time.time()
-_trace_task = [0]
 _trace_prev = {"qd": None, "n": 0, "last_print": 0.0}
 ANOMALY_ERR_RAD = 0.06       # commanded-vs-actual error on a joint
 ANOMALY_DQD_STEP = 0.6       # velocity change within one step (rad/s): a kick / jerk
@@ -1115,8 +1083,7 @@ ARRIVE_XY_M = 0.015              # hand within this of the target xy before the 
 ARRIVE_WAIT_MAX_FRAMES = 400     # give up waiting after this many extra frames
 LIFT_WAIT_MAX_FRAMES = 150        # give up waiting for that after this many frames
 RELEASE_HOLD_FRAMES = 14          # frames the arm holds still while the fingers open
-# Shared post-place verification tolerances — used by both the deterministic
-# PickPlaceController path and the GR00T VLA path (see each's own verification block).
+# Post-place verification tolerances.
 # XY tolerance is half a cube width; Z gets a looser tolerance since a dropped/settled
 # cube can still be bouncing/rotating slightly when verification fires.
 POSITION_XY_TOLERANCE_M = 0.03
@@ -1510,63 +1477,6 @@ PICK_PLACE_EVENT_NAMES = {
     9: "Returning to Staging Position",
 }
 
-# ── 6.5. Real GR00T-N1.7 VLA Closed-Loop Client (Phase 3) ──────────────────────
-# GR00T's torch/transformers/flash-attn build only exists in Isaac-GR00T/.venv, not in Isaac
-# Sim's own bundled Python this file runs under — so real inference runs as a separate process
-# (groot_policy_service.py, port 8300) and this is an HTTP client of it, same pattern as the
-# Nemotron server. Real forward passes only: no keyword-matching fallback exists here.
-GROOT_SERVER_URL = "http://localhost:8300"
-VLA_ACTION_ORDER = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
-# Fixed downward grasp orientation for state feedback — we don't have a real measured EE
-# orientation telemetry channel, so this constant matches the fixed DOWNWARD_ROT convention
-# every other part of the pipeline already assumes for a top-down grasp. VLA-predicted
-# roll/pitch/yaw deltas are intentionally NOT applied to arm orientation for this first
-# closed-loop pass — only xyz position + gripper are driven from the model, to avoid
-# compounding orientation error on top of an already-approximate state input.
-VLA_FIXED_RPY = np.array([3.14159, 0.0, 0.0], dtype=np.float32)
-# Workspace safety clamp — VLA position deltas accumulate every step; without bounds an
-# out-of-distribution prediction (this checkpoint isn't fine-tuned on our scene) could walk
-# the target outside the reachable workspace or into the table.
-VLA_XYZ_MIN = np.array([0.20, -0.45, 0.035], dtype=np.float32)
-VLA_XYZ_MAX = np.array([0.70, 0.45, 0.45], dtype=np.float32)
-# Same fixed downward end-effector orientation PickPlaceController itself defaults to
-# (euler_angles_to_quat([0, pi, 0])) — reused here for consistency, not re-derived.
-VLA_DOWNWARD_QUAT = euler_angles_to_quat(np.array([0, np.pi, 0]))
-VLA_HOLD_FRAMES = 15   # physics frames to hold/converge on each chunk step's target (~0.25s)
-VLA_MAX_CHUNKS = 4     # cap total re-queries per task so an out-of-distribution loop can't run forever
-
-
-def encode_frame_b64(raw_rgb: np.ndarray) -> str:
-    """JPEG-encodes a raw RGB annotator frame to a base64 string for the GR00T HTTP API."""
-    bgr = cv2.cvtColor(raw_rgb[:, :, :3], cv2.COLOR_RGB2BGR)
-    _, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    return base64.b64encode(encoded.tobytes()).decode("ascii")
-
-
-def query_groot_server(instruction: str, scene_rgb: np.ndarray, wrist_rgb: np.ndarray,
-                        ee_xyz: np.ndarray, gripper_width: float):
-    """Calls the real GR00T-N1.7 policy server. Returns (horizon, 7) np.ndarray or None on error."""
-    ee_pose6 = [float(ee_xyz[0]), float(ee_xyz[1]), float(ee_xyz[2]),
-                float(VLA_FIXED_RPY[0]), float(VLA_FIXED_RPY[1]), float(VLA_FIXED_RPY[2])]
-    payload = jsonlib.dumps({
-        "instruction": instruction,
-        "scene_image_b64": encode_frame_b64(scene_rgb),
-        "wrist_image_b64": encode_frame_b64(wrist_rgb),
-        "ee_pose": ee_pose6,
-        "gripper_width": float(gripper_width),
-    }).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            f"{GROOT_SERVER_URL}/predict", data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
-            data = jsonlib.loads(resp.read().decode("utf-8"))
-            return np.array(data["action_chunk"], dtype=np.float32)
-    except Exception as e:
-        print(f"[GR00T VLA] Query failed: {e}", flush=True)
-        return None
-
 # ── 7. FastAPI App for Streaming & Control ─────────────────────────────────────
 api_app = FastAPI(title="Isaac Sim Franka Stream Service", version="2.0.0")
 api_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -1791,7 +1701,7 @@ def randomize_cubes():
 @api_app.post("/hard_stop")
 def hard_stop():
     """Emergency stop for the GUI's red 'Hard Reset' button — abort whatever's running (a
-    mid-motion pick_place, an in-flight VLA chunk, anything still queued) and home the arm,
+    mid-motion pick_place, anything still queued) and home the arm,
     without touching cube positions. Just sets a flag + drains the queue; the actual abort
     happens synchronously at the top of the sim loop on its next frame (see hard_stop_event
     below) since only that thread may safely touch the robot/controller/USD stage."""
@@ -1814,7 +1724,6 @@ print("  📡 Live HD Camera Streams: http://localhost:8100/                ", f
 print("═══════════════════════════════════════════════════════════════════", flush=True)
 
 active_pick_place = None  # dict: {picking_position, placing_position, matched_target} or None
-active_vla = None  # dict: {instruction, chunk, step_idx, target_xyz} or None — Phase 3 GR00T loop
 last_fps_time = time.time()
 fps_counter = 0
 held_object_key = None
@@ -1921,55 +1830,6 @@ def encode_camera_frame(raw_rgb, label: str, overlay: bool = False):
     return encoded.tobytes()
 
 
-def _verify_vla_task(instruction: str):
-    """Real post-place verification for a GR00T VLA-driven task — this used to not exist at
-    all: the VLA loop just ran its chunk budget and stopped, with no last_task_success/
-    last_task_error_mm ever computed, so there was no way to know whether GR00T actually
-    accomplished anything. Reuses the exact same resolution (resolve_pick_place_targets —
-    safe to call again, it's pure planning logic with no side effects of its own) and
-    tolerances (POSITION_XY/Z_TOLERANCE_M) the deterministic path already uses, so
-    VLA-driven and PickPlaceController-driven actions are judged by the same real standard,
-    not two different bars. This does not make GR00T reliable — it makes its real
-    (un)reliability observable, which it wasn't before."""
-    try:
-        matched_target, picking_pos, placing_position, target_name, _ref = \
-            resolve_pick_place_targets(instruction)
-    except Exception as e:
-        print(f"[GR00T VLA] Could not resolve a verification target for '{instruction}': {e}", flush=True)
-        with telemetry_lock:
-            sim_telemetry["last_task_success"] = None
-            sim_telemetry["last_task_error_mm"] = None
-        return
-    final_pos = get_live_object_pos(matched_target)
-    err_xy = float(np.hypot(final_pos[0] - placing_position[0], final_pos[1] - placing_position[1]))
-    err_z = float(abs(final_pos[2] - placing_position[2]))
-    position_ok = (err_xy <= POSITION_XY_TOLERANCE_M) and (err_z <= POSITION_Z_TOLERANCE_M)
-
-    # Same real "did it actually move" check as the deterministic path — VLA has no
-    # discrete grasp-close phase to hook a grasp-confirmation check onto the way
-    # PickPlaceController does, but this displacement check is free either way.
-    displacement_m = float(np.hypot(final_pos[0] - picking_pos[0], final_pos[1] - picking_pos[1]))
-    intended_displacement_m = float(np.hypot(placing_position[0] - picking_pos[0], placing_position[1] - picking_pos[1]))
-    moved_enough = (intended_displacement_m < MEANINGFUL_DISPLACEMENT_M) or \
-        (displacement_m >= MEANINGFUL_DISPLACEMENT_M * 0.5)
-    task_success = position_ok and moved_enough
-
-    with telemetry_lock:
-        sim_telemetry["last_task_success"] = task_success
-        sim_telemetry["last_task_error_mm"] = round(err_xy * 1000.0, 1)
-        sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1)
-    fail_reasons = []
-    if not position_ok:
-        fail_reasons.append(f"missed target by {err_xy * 1000:.1f}mm")
-    if not moved_enough:
-        fail_reasons.append(f"barely moved ({displacement_m * 1000:.1f}mm, expected ~{intended_displacement_m * 1000:.1f}mm)")
-    print(
-        f"[GR00T VLA] Task Verification: {'PASS' if task_success else 'FAIL'} — "
-        f"'{target_name}' landed {err_xy * 1000:.1f}mm (xy) / {err_z * 1000:.1f}mm (z) "
-        f"from resolved target {np.round(placing_position, 3)} (actual {np.round(final_pos, 3)})"
-        + (f" — {'; '.join(fail_reasons)}" if fail_reasons else ""), flush=True
-    )
-
 # ── Frame-cost knobs ─────────────────────────────────────────────────────────────────────────────────
 # The loop used to call rep.orchestrator.step() every frame, which renders ALL camera products a second time
 # (world.step(render=True) has already rendered them and the annotators already hold that frame). Skipping it
@@ -2012,14 +1872,13 @@ try:
     while simulation_app.is_running():
         _t_iter0 = time.perf_counter()
         # -1. Emergency Hard Stop — pre-empts everything else this frame. Aborts whatever
-        #     task is active (pick_place or VLA), drops it without finishing its motion,
+        #     task is active, drops it without finishing its motion,
         #     opens the gripper, sends the arm home, AND returns every cube to its default
         #     staging spot — the button is meant as a full "get back to a known-good state"
         #     reset, not just a motion abort.
         if hard_stop_event.is_set():
             hard_stop_event.clear()
             active_pick_place = None
-            active_vla = None
             held_object_key = None
             _drain_command_queue()  # catches anything queued between /hard_stop and this frame
             with telemetry_lock:
@@ -2033,8 +1892,6 @@ try:
                 sim_telemetry["stage"] = "READY"
                 sim_telemetry["last_instruction"] = "Hard reset — ready for new commands"
                 sim_telemetry["current_request_id"] = 0
-                sim_telemetry["vla_reasoning"] = None
-                sim_telemetry["vla_chunks_done"] = 0
             print("[Isaac Sim Service] HARD STOP — task aborted, arm homed, cubes reset to default.", flush=True)
             continue
 
@@ -2044,7 +1901,7 @@ try:
             set_lighting_preset(preset_name)
 
         # 1. Process Pending Commands
-        if active_pick_place is None and active_vla is None and not command_queue.empty():
+        if active_pick_place is None and not command_queue.empty():
             req_id, cmd = command_queue.get_nowait()
             with telemetry_lock:
                 sim_telemetry["busy"] = True
@@ -2067,8 +1924,6 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
             elif "home" in cmd:
                 # Robot only — cube positions are left exactly where they are.
                 with telemetry_lock:
@@ -2080,8 +1935,6 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
             elif "randomize" in cmd or "shuffle" in cmd or "random" in cmd:
                 with telemetry_lock:
                     sim_telemetry["stage"] = "RANDOMIZING CUBE POSITIONS"
@@ -2089,21 +1942,9 @@ try:
                 with telemetry_lock:
                     sim_telemetry["busy"] = False
                     sim_telemetry["stage"] = "READY"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
-            elif cmd.strip().lower().startswith("vla:") or cmd.strip().lower().startswith("vla "):
-                # Real GR00T-N1.7 closed-loop mode — separate from the reliable
-                # PickPlaceController path above, opt-in via a "vla:" prefix so the default
-                # instruction path stays on the validated, deterministic controller.
-                vla_instruction = cmd.split(":", 1)[-1].strip() if ":" in cmd else cmd[4:].strip()
-                active_vla = {"instruction": vla_instruction, "chunk": None, "step_idx": 0}
-                with telemetry_lock:
-                    sim_telemetry["stage"] = f"GR00T VLA — Querying Model"
             else:
                 with telemetry_lock:
                     sim_telemetry["stage"] = "ASSESSING SCENE"
-                    sim_telemetry["vla_reasoning"] = None
-                    sim_telemetry["vla_chunks_done"] = 0
                 try:
                     # Perception grounding + (in vision mode) actually driving target_pos/
                     # tray_pos/ref_pos now happens INSIDE resolve_pick_place_targets itself
@@ -2148,7 +1989,6 @@ try:
                         "reference_key": reference_key,
                         "grasp_checked": False,
                     }
-                    episode_recorder.start_episode(cmd)
                 except Exception as e:
                     print(f"[Planner Error] {e}", flush=True)
                     with telemetry_lock:
@@ -2227,7 +2067,6 @@ try:
                         sim_telemetry["last_task_error_mm"] = None
                         sim_telemetry["last_object_displacement_mm"] = (
                             round(displacement_m * 1000.0, 1) if displacement_m is not None else None)
-                    episode_recorder.end_episode(False)  # early grasp-fail abort — drop the episode
                     try:
                         if not CUBE_OBSTACLES:
                             raise StopIteration     # cubes are not registered in this mode: nothing to re-enable
@@ -2246,11 +2085,6 @@ try:
                         sim_telemetry["stage"] = "READY"
             elif event_idx == 7:
                 held_object_key = None
-
-        # Captured before this block can clear active_pick_place back to None below, so the
-        # episode recorder's per-frame tap (in section 4, after raw camera frames are
-        # captured) knows whether a pick_place task was actually running this frame.
-        _recording_active_this_frame = active_pick_place is not None
 
         # Release on contact. Phase 6 lowers the cube on a fixed schedule; if the cube meets the surface early (it sits
         # a few mm low in the fingers, the table/stack surface is a little higher than assumed, or the arm overshoots) the
@@ -2392,9 +2226,6 @@ try:
                     sim_telemetry["last_task_success"] = task_success
                     sim_telemetry["last_task_error_mm"] = round(err_xy * 1000.0, 1) if np.isfinite(err_xy) else None
                     sim_telemetry["last_object_displacement_mm"] = round(displacement_m * 1000.0, 1) if np.isfinite(displacement_m) else None
-                # Flush (on success) or drop (on failure) the just-finished episode, using
-                # Physyk's own real verification above as the ground-truth label.
-                episode_recorder.end_episode(task_success)
                 fail_reasons = []
                 if not position_ok:
                     fail_reasons.append(f"missed target by {err_xy * 1000:.1f}mm")
@@ -2429,107 +2260,8 @@ try:
                     sim_telemetry["stage"] = "READY"
 
         # Idle and holding nothing: keep the fingers wide open (0.04 each), so the next grasp never starts half-closed.
-        if active_pick_place is None and active_vla is None and held_object_key is None:
+        if active_pick_place is None and held_object_key is None:
             articulation_controller.apply_action(robot.gripper.forward(action="open"))
-
-        # 2.5. Advance the real GR00T-N1.7 closed-loop VLA control mode (Phase 3). Observe
-        #      (live camera + EE pose) -> real model forward pass -> 16-step delta chunk ->
-        #      drive the arm through RMPFlow one delta-step at a time, re-observing every
-        #      chunk. Genuinely separate code path from the PickPlaceController above — no
-        #      keyword matching, no scripted waypoints; whatever xyz it predicts is what
-        #      drives the arm (gripper too, clamped to a safe range).
-        if active_vla is not None:
-            if active_vla["chunk"] is None:
-                if active_vla.get("chunks_done", 0) >= VLA_MAX_CHUNKS:
-                    print(f"[GR00T VLA] Reached max chunk budget ({VLA_MAX_CHUNKS}) — ending task.", flush=True)
-                    _verify_vla_task(active_vla["instruction"])
-                    active_vla = None
-                    with telemetry_lock:
-                        sim_telemetry["busy"] = False
-                        sim_telemetry["stage"] = "READY"
-                else:
-                    with telemetry_lock:
-                        sim_telemetry["stage"] = f"GR00T VLA — Querying Model ({active_vla['instruction']})"
-                    scene_rgb = scene_annot.get_data()
-                    wrist_rgb = wrist_annot.get_data()
-                    ee_xyz = get_end_effector_pos()
-                    dofs = robot.get_joint_positions()
-                    if dofs is not None and dofs.ndim > 1:
-                        dofs = dofs.flatten()
-                    gripper_width = float(dofs[7] * 2.0) if dofs is not None and len(dofs) > 7 else 0.04
-                    chunk = None
-                    if scene_rgb is not None and scene_rgb.size > 0 and wrist_rgb is not None and wrist_rgb.size > 0:
-                        chunk = query_groot_server(active_vla["instruction"], scene_rgb, wrist_rgb, ee_xyz, gripper_width)
-                    if chunk is None:
-                        print("[GR00T VLA] No usable chunk (camera not ready or server error) — ending task.", flush=True)
-                        # Only verify if at least one chunk actually ran — with zero real
-                        # motion attempted, there's nothing meaningful to check yet.
-                        if active_vla.get("chunks_done", 0) > 0:
-                            _verify_vla_task(active_vla["instruction"])
-                        active_vla = None
-                        with telemetry_lock:
-                            sim_telemetry["busy"] = False
-                            sim_telemetry["stage"] = "READY"
-                    else:
-                        active_vla["chunk"] = chunk
-                        active_vla["step_idx"] = 0
-                        active_vla["hold_counter"] = 0
-                        active_vla["target_xyz"] = ee_xyz.astype(np.float32).copy()
-                        active_vla["gripper_target"] = gripper_width
-                        active_vla["chunks_done"] = active_vla.get("chunks_done", 0) + 1
-                        # GR00T is a DiT action head, not a language model — it has no natural-
-                        # language "reasoning" to show. This is the honest substitute: a real
-                        # summary of what the model actually predicted for this chunk (net
-                        # displacement direction/magnitude + gripper intent), computed from the
-                        # real action_chunk tensor, not narration. Surfaced via /state so the UI
-                        # can show "what GR00T is doing" per chunk instead of a silent black box.
-                        net_xyz = chunk[:, :3].sum(axis=0)
-                        move_mag_cm = float(np.linalg.norm(net_xyz) * 100.0)
-                        move_dir = []
-                        if abs(net_xyz[0]) > 0.005: move_dir.append(("forward" if net_xyz[0] > 0 else "backward"))
-                        if abs(net_xyz[1]) > 0.005: move_dir.append(("left" if net_xyz[1] > 0 else "right"))
-                        if abs(net_xyz[2]) > 0.005: move_dir.append(("up" if net_xyz[2] > 0 else "down"))
-                        gripper_end = float(chunk[-1, 6])
-                        gripper_intent = "closing (grasp)" if gripper_end < gripper_width - 0.005 else (
-                            "opening (release)" if gripper_end > gripper_width + 0.005 else "holding")
-                        vla_reasoning = (
-                            f"Chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS}: predicted net move "
-                            f"{move_mag_cm:.1f}cm {'/'.join(move_dir) if move_dir else 'in place'}, "
-                            f"gripper {gripper_intent}."
-                        )
-                        with telemetry_lock:
-                            sim_telemetry["vla_reasoning"] = vla_reasoning
-                            sim_telemetry["vla_chunks_done"] = active_vla["chunks_done"]
-                        print(f"[GR00T VLA] Chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS} received, shape {chunk.shape} — {vla_reasoning}", flush=True)
-            else:
-                chunk = active_vla["chunk"]
-                idx = active_vla["step_idx"]
-                with telemetry_lock:
-                    sim_telemetry["stage"] = (
-                        f"GR00T VLA — Step {idx + 1}/{len(chunk)} "
-                        f"(chunk {active_vla['chunks_done']}/{VLA_MAX_CHUNKS}) — {active_vla['instruction']}"
-                    )
-
-                if active_vla["hold_counter"] == 0:
-                    delta = chunk[idx]  # order: x, y, z, roll, pitch, yaw, gripper (see VLA_ACTION_ORDER)
-                    new_target = active_vla["target_xyz"] + delta[:3]
-                    active_vla["target_xyz"] = np.clip(new_target, VLA_XYZ_MIN, VLA_XYZ_MAX).astype(np.float32)
-                    active_vla["gripper_target"] = float(np.clip(delta[6], 0.0, 0.04))
-
-                cspace_actions = pick_place_controller._cspace_controller.forward(
-                    target_end_effector_position=active_vla["target_xyz"],
-                    target_end_effector_orientation=VLA_DOWNWARD_QUAT,
-                )
-                articulation_controller.apply_action(cspace_actions)
-                g = active_vla["gripper_target"]
-                robot.gripper.apply_action(ArticulationAction(joint_positions=np.array([g, g], dtype=np.float32)))
-
-                active_vla["hold_counter"] += 1
-                if active_vla["hold_counter"] >= VLA_HOLD_FRAMES:
-                    active_vla["hold_counter"] = 0
-                    active_vla["step_idx"] += 1
-                    if active_vla["step_idx"] >= len(chunk):
-                        active_vla["chunk"] = None  # triggers a fresh observe+query next iteration
 
         # 3. Step PhysX Simulation & Rendering
         #    NOTE: physics-only sub-stepping (several world.step(render=False) per rendered frame) was tried to
@@ -2563,17 +2295,6 @@ try:
             except Exception as _e:
                 print(f"[WARN] Frame dump failed: {_e}", flush=True)
         _prof_add("annotator get_data", time.perf_counter() - _t_get0)
-
-        # GR00T fine-tuning episode recorder tap — no-op unless RECORD_EPISODES=1 (see top of
-        # file). Uses the same raw (pre-HUD-overlay) frames as the JPEG/stream encoding below,
-        # and current live EE/gripper state, without altering anything else in this section.
-        if _recording_active_this_frame and raw_scene is not None and raw_scene.size > 0 \
-                and raw_wrist is not None and raw_wrist.size > 0:
-            _dofs_for_recording = robot.get_joint_positions()
-            if _dofs_for_recording is not None and _dofs_for_recording.ndim > 1:
-                _dofs_for_recording = _dofs_for_recording.flatten()
-            _gripper_w = float(_dofs_for_recording[7] * 2.0) if _dofs_for_recording is not None and len(_dofs_for_recording) > 7 else 0.04
-            episode_recorder.log_frame(raw_scene, raw_wrist, get_end_effector_pos(), _gripper_w)
 
         # The JPEG streams only need ~half the loop rate; encoding every Nth iteration frees time for physics steps.
         _enc_iter += 1

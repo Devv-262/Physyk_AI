@@ -25,6 +25,9 @@ COLOR_SPECS = {
     "red_cube":   {"hue": [(0, 12), (170, 179)], "s_min": 80, "v_min": 150, "s_weak": 35, "v_weak": 200},
     "green_cube": {"hue": [(60, 90)],            "s_min": 70, "v_min": 150, "s_weak": 35, "v_weak": 200},
     "blue_cube":  {"hue": [(92, 108)],           "s_min": 65, "v_min": 190, "s_weak": 35, "v_weak": 215},
+    # The yellow tray (a flat slab). It never moves and is a fixed pose in camera-only mode, so this spec is only used by
+    # locate_cube() on the tray (the offline perception test); its top face renders pale (S ~65), its side faces S ~110.
+    "target_tray": {"hue": [(20, 38)],           "s_min": 85,  "v_min": 150, "s_weak": 45, "v_weak": 200, "slab": True},
 }
 
 # Vertical half-extent of each object, to turn the measured TOP surface height into a center Z.

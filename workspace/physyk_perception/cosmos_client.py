@@ -1,10 +1,6 @@
-"""Grounding calls to the served Cosmos 3 Nano Reasoner model (port 8001, OpenAI-compatible
-/v1/chat/completions). Reuses exactly the parsing behavior confirmed empirically earlier in
-this project (cosmos_smoke_test.py, perception_calib/): the real answer often lands in the
-`reasoning` field (not `content`) because the server runs with --reasoning-parser qwen3, and
-grounding coordinates are normalized 0-1000 relative to image dimensions ("norm1000"), not
-raw pixels — confirmed twice, once on a synthetic image and once on a real captured Isaac Sim
-frame, with real pixel-error measurements both times.
+"""Calls to the served Cosmos 3 Nano Reasoner model (port 8001, OpenAI-compatible /v1/chat/completions): visual Q&A and object
+grounding. The real answer often lands in the `reasoning` field (not `content`) because the server runs with a reasoning parser,
+and grounding coordinates are normalized 0-1000 relative to the image dimensions ("norm1000"), not raw pixels.
 """
 
 import base64

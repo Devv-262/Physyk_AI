@@ -16,8 +16,6 @@ import time
 import asyncio
 import threading
 import subprocess
-import math
-import base64
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -26,21 +24,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import numpy as np
 import cv2
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response, Request
+from fastapi import FastAPI, Response, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# Real Phase 5 agentic orchestrator (Nemotron decomposition + guardrails + dispatch/verify
-# loop) — pure HTTP client of the Nemotron (8000) and Isaac Sim (8100) servers, so it's cheap
-# to import here under plain python3. Previously this block also imported/instantiated
-# GR00TN17PolicyService() (which loads a real model in-process) and an unused ROS2RGBDBridge;
-# neither is used by anything in this file — the real GR00T VLA path lives entirely in its own
-# server (port 8300) plus isaac_sim_service.py's HTTP client of it. GR00TN17PolicyService()
-# also can't actually load here (the `gr00t` package isn't installed under plain python3,
-# only in Isaac-GR00T/.venv) — confirmed it was silently failing and getting swallowed by the
-# `except ImportError` below (ModuleNotFoundError is a subclass of ImportError) every time
-# this server started, so nemo_agent was never actually usable. Removed both.
+# Agentic orchestrator (Nemotron decomposition + guardrails + dispatch/verify loop) — a pure HTTP client of the Nemotron API and
+# Isaac Sim (8100), so it is cheap to import here.
 # Non-agentic test mode (run.sh --no-agent, or PHYSYK_AGENTIC=0 directly) — skips loading
 # the orchestrator entirely, so every instruction falls through the existing
 # `if not AI_STACK_AVAILABLE` branch in execute_instruction() below and goes straight to
@@ -119,9 +109,6 @@ def _render_perception_log_page() -> str:
 
 custom_pages["perception"] = _render_perception_log_page
 
-connected_ws: list = []
-broadcast_lock = threading.Lock()
-
 # ─── Fallback / Cached Simulation State ───────────────────────────────────────
 sim_state = {
     "joints": [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785],
@@ -142,17 +129,6 @@ sim_state = {
     # last grounding call's stage-vs-vision delta per object. Purely informational: nothing
     # in sim_state or the dispatch path reads this to make a decision.
     "perception": None,
-    # Real GR00T VLA per-chunk summary (isaac_sim_service.py's own vla_reasoning field) —
-    # None unless a "vla:"-prefixed task has actually run at least one chunk through the
-    # model. Not narration: a real summary of the model's own predicted action_chunk tensor.
-    "vla_reasoning": None,
-    # Structured chunk counter alongside vla_reasoning — was declared here but never
-    # actually forwarded from Isaac Sim's /state in the poll loop below, so this field was
-    # silently stuck at Python's implicit None (missing key) forever regardless of what
-    # Isaac Sim reported. Chunk progress was still visible via vla_reasoning's own text and
-    # via `stage`, so nothing downstream broke, but any future UI wanting the structured
-    # count (e.g. a progress bar) was reading a permanently-null field. Fixed alongside.
-    "vla_chunks_done": None,
     # Live online/offline status for all 4 backing services, independent of whether the
     # "Send to Agent" toggle is on — the toggle only changes dispatch ROUTING (see
     # /agent_toggle's own docstring), it never starts or stops anything, so this panel is
@@ -169,25 +145,6 @@ def push_log(msg, level="INFO"):
     sim_state["log"].append(entry)
     if len(sim_state["log"]) > 200:
         sim_state["log"] = sim_state["log"][-100:]
-
-async def broadcast(data: dict):
-    dead = []
-    for ws in list(connected_ws):
-        try:
-            await ws.send_json(data)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        try: connected_ws.remove(ws)
-        except: pass
-
-def sync_broadcast(data: dict):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(broadcast(data), loop)
-    except RuntimeError:
-        pass
 
 # ─── Isaac Sim Bridge Communication ───────────────────────────────────────────
 def poll_isaac_sim_state():
@@ -279,7 +236,7 @@ service_status_thread.start()
 
 def _forward_direct_to_isaac(instruction: str):
     """Fire-and-forget single instruction straight to Isaac Sim's /execute — the original
-    dispatch path, kept as-is for plain control commands (reset/home/randomize/vla:) that
+    dispatch path, kept as-is for plain control commands (reset/home/randomize) that
     don't need LLM reasoning and that Isaac Sim's own loop already keyword-detects reliably."""
     try:
         req = urllib.request.Request(
@@ -352,10 +309,6 @@ def execute_instruction(instruction: str):
     (camera streaming, /state polling for the GUI). Falls back to the direct single-shot path
     if the orchestrator isn't available, or if the "Send to Agent" switch is off."""
     push_log(f"Command received: '{instruction}'", "INFO")
-
-    if instruction.strip().lower().startswith(("vla:", "vla ")):
-        push_log("The GR00T VLA path is disabled in this build — ignoring 'vla:' command.", "WARN")
-        return {"status": "rejected", "instruction": instruction, "error": "VLA disabled"}
 
     if not AI_STACK_AVAILABLE or not agent_enabled or _is_control_command(instruction):
         return _forward_direct_to_isaac(instruction)
@@ -477,7 +430,7 @@ def hard_reset():
          if a multi-step plan is mid-flight — via request_stop(), checked at every
          poll/loop boundary so it bails out within one poll interval instead of running a
          subgoal, a retry, or a Nemotron replan call to completion first.
-      2. Isaac Sim's own physics loop, which may be mid-motion on a pick_place or VLA task
+      2. Isaac Sim's own physics loop, which may be mid-motion on a pick_place task
          dispatched either by the orchestrator or directly — via isaac_sim_service.py's own
          /hard_stop, which drops whatever's active, homes the arm, and resets every cube."""
     push_log("HARD RESET — stopping any active plan/task, homing the arm, and resetting objects...", "WARN")
@@ -663,7 +616,7 @@ HTML = """<!DOCTYPE html>
   .dot.busy { background: var(--amber); box-shadow: 0 0 8px var(--amber); animation: pulse 0.6s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 
-  /* 4-service status strip — real process health for Isaac Sim / Nemotron / Cosmos / GR00T,
+  /* Service status strip — real process health for Isaac Sim / Nemotron / Cosmos,
      independent of the agent toggle (a service can be ONLINE while the toggle routes
      around it). See poll_service_status() in the Python backend. */
   .svc-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -1093,7 +1046,7 @@ HTML = """<!DOCTYPE html>
 </footer>
 
 <script>
-  const bp = window.location.pathname.replace(/\/$/, '');
+  const bp = window.location.pathname.replace(/\\/$/, '');
   // The API/stream directory links are rendered with a relative data-path — resolved here
   // against the real base path (accounts for being served behind a reverse proxy, same as
   // every fetch() below already does via `bp`). Setting bare "/state"-style hrefs directly
