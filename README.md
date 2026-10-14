@@ -96,6 +96,8 @@ Latest end-to-end run on the real sim (default settings, 10 randomized layouts, 
 | `workspace/physyk_perception/` | Camera-only cube detection, Cosmos client, step verifier, overlay layout |
 | `assets/` | Franka Panda and scene object assets |
 | `scripts/` | Helper and diagnostic shell scripts |
+| `workspace/scripts/arm_tests/` | End-to-end batch and arm-physics test tools (see its README) |
+| `CLAUDE.md` | Working notes for Claude Code sessions in this repo |
 | `run.sh`, `start_*_docker.sh` | Launchers |
 
 ## Documentation

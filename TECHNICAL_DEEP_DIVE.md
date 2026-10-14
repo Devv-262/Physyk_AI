@@ -140,7 +140,8 @@ The sim writes `workspace/joint_trace.csv` (disable with `PHYSYK_JOINT_TRACE=0`)
 phase time, hand yaw, joints 1-7 (position, commanded target, velocity, error), finger width, end-effector, cube and hand
 positions. It also prints `[Joint anomaly] <cube> phase <n> …` lines to the sim log when joints 2-6 show a tracking error over
 0.06 rad or a velocity kick over 0.6 rad/s in one iteration, with the hand height and all seven joint angles. Typical runs show
-none; one camera-only run showed a single 0.67 rad/s kick on joint 2.
+none; one camera-only run showed a single 0.67 rad/s kick on joint 2. The scripts that analyse the trace, run end-to-end batches on the
+sim, and reproduce a pick in a standalone harness are in `workspace/scripts/arm_tests/`.
 
 ---
 
