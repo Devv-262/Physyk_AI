@@ -445,6 +445,11 @@ def get_end_effector_pos() -> np.ndarray:
         print(f"[USD Transform Query Error] {e}", flush=True)
     return np.array([0.45, 0.0, 0.40], dtype=np.float32)
 
+if os.environ.get("PHYSYK_RANDOM_SEED"):
+    np.random.seed(int(os.environ["PHYSYK_RANDOM_SEED"]))      # same sequence of "randomize" layouts on every start (for A/B tests)
+    print(f"[Isaac Sim Service] numpy random seed fixed to {os.environ['PHYSYK_RANDOM_SEED']}.", flush=True)
+
+
 def reset_scene_cubes():
     """Resets all 3 cubes to their designated staging spots on the table with zero velocity."""
     for key, data in SCENE_OBJECTS.items():
@@ -465,6 +470,7 @@ def reset_scene_cubes():
 CUBE_RANDOM_X_RANGE = (0.28, 0.65)
 CUBE_RANDOM_Y_RANGE = (-0.15, 0.42)   # y 0.54 (radius 0.70) was beyond the downward-gripper reach: the hand stopped 10 cm above the cube
 CUBE_MAX_RADIUS_M = 0.66
+CUBE_MIN_RADIUS_M = float(os.environ.get("PHYSYK_MIN_RADIUS", "0.38"))  #   # closer than this the arm folds until joint 6 reaches its limit (3.7525 rad) and the grasp fails (measured: a pick at 0.33 m)
 CUBE_MIN_SEPARATION = 0.10  # meters between cube centers, so they don't spawn overlapping
 
 def randomize_scene_cubes():
@@ -483,7 +489,7 @@ def randomize_scene_cubes():
             for _attempt in range(50):
                 cx = float(np.random.uniform(*CUBE_RANDOM_X_RANGE))
                 cy = float(np.random.uniform(*CUBE_RANDOM_Y_RANGE))
-                if math.hypot(cx, cy) <= CUBE_MAX_RADIUS_M and all(math.hypot(cx - px, cy - py) >= CUBE_MIN_SEPARATION for px, py in placed):
+                if CUBE_MIN_RADIUS_M <= math.hypot(cx, cy) <= CUBE_MAX_RADIUS_M and all(math.hypot(cx - px, cy - py) >= CUBE_MIN_SEPARATION for px, py in placed):
                     x, y = cx, cy
                     break
             if x is None:  # 50 rejection-sampling attempts failed (very unlikely with 3 cubes)
@@ -917,28 +923,45 @@ pick_place_controller = PickPlaceController(
 )
 articulation_controller = robot.get_articulation_controller()
 
-# ── 4.7. Register Real Collision Obstacles with RMPFlow (Phase 2: collision-aware planning) ──
-# RMPFlow does NOT automatically know about scene geometry — obstacles must be explicitly
-# registered, or it plans paths blind to the table/tray/other cubes (per
-# isaacsim.robot_motion.motion_generation's WorldInterface.add_obstacle docs). The table and
-# tray are permanent, always-on static obstacles. The three cubes are also registered so the
-# arm routes around whichever ones it isn't currently grasping — but the *current pick target*
-# must be temporarily disabled each task, or RMPFlow would refuse to let the gripper
-# approach/enclose it at all.
+# ── 4.7. RMPFlow collision obstacles (optional, off by default) ─────────────────────────────────────────────────
+# RMPFlow only avoids what is registered with it. NOTE: PickPlaceController.reset() clears every registered obstacle
+# (measured: 2 registered -> 0 after reset), so registering once at startup does nothing once the first task resets the
+# controller. The obstacles are therefore re-registered after EVERY reset (_controller_reset below).
+#   PHYSYK_ARM_OBSTACLES=off     (default) no avoidance: the arm travels well above the cubes and descends vertically, the
+#                                hand yaw is picked to keep the fingers clear of neighbours, and in measurements active
+#                                obstacles were the only setup in which the arm ever swung joints 1-6 to the velocity cap
+#   PHYSYK_ARM_OBSTACLES=static  table + tray
+#   PHYSYK_ARM_OBSTACLES=all     table + tray + the cubes (the cube being picked / stacked onto is disabled per task)
+# PHYSYK_CUBE_OBSTACLES=1 is the old spelling of "all".
 rmpflow_motion_policy = pick_place_controller._cspace_controller.get_motion_policy()
-# Other cubes as avoidance obstacles for the arm (PHYSYK_CUBE_OBSTACLES=1). Off by default: the arm already travels well above
-# the cubes (hand centre >= 0.2 m) and descends vertically, and the hand yaw is picked to keep clear of neighbours; with them
-# on, a free cube beside the pile pushes the planner sideways and the arm jitters on every approach/placement near it.
-CUBE_OBSTACLES = os.environ.get("PHYSYK_CUBE_OBSTACLES", "0") == "1"
 CUBE_OBJECTS = {"red_cube": red_cube_obj, "blue_cube": blue_cube_obj, "green_cube": green_cube_obj}
-try:
-    rmpflow_motion_policy.add_obstacle(work_table_obj, static=True)
-    rmpflow_motion_policy.add_obstacle(target_tray_obj, static=True)
-    for cube_obj in CUBE_OBJECTS.values():
-        rmpflow_motion_policy.add_obstacle(cube_obj, static=False)
-    print("[Isaac Sim Service] Registered table, tray, and all 3 cubes as RMPFlow collision obstacles.", flush=True)
-except Exception as e:
-    print(f"[WARN] Could not register RMPFlow obstacles, planning will be collision-blind: {e}", flush=True)
+ARM_OBSTACLE_MODE = os.environ.get("PHYSYK_ARM_OBSTACLES", "all" if os.environ.get("PHYSYK_CUBE_OBSTACLES", "0") == "1" else "off").lower()
+if ARM_OBSTACLE_MODE not in ("off", "static", "all"):
+    ARM_OBSTACLE_MODE = "off"
+CUBE_OBSTACLES = ARM_OBSTACLE_MODE == "all"
+
+
+def _register_arm_obstacles():
+    """(Re-)registers the RMPFlow obstacles for the configured mode. Called after every controller reset."""
+    if ARM_OBSTACLE_MODE == "off":
+        return
+    try:
+        rmpflow_motion_policy.add_obstacle(work_table_obj, static=True)
+        rmpflow_motion_policy.add_obstacle(target_tray_obj, static=True)
+        if CUBE_OBSTACLES:
+            for cube_obj in CUBE_OBJECTS.values():
+                rmpflow_motion_policy.add_obstacle(cube_obj, static=False)
+    except Exception as e:
+        print(f"[WARN] Could not register RMPFlow obstacles, planning will be collision-blind: {e}", flush=True)
+
+
+def _controller_reset():
+    """pick_place_controller.reset() + re-register the obstacles that reset just cleared."""
+    pick_place_controller.reset()
+    _register_arm_obstacles()
+
+
+print(f"[Isaac Sim Service] RMPFlow obstacles: mode '{ARM_OBSTACLE_MODE}' (registered after every controller reset).", flush=True)
 
 # ── 5. Shared Global State & Command Queue ────────────────────────────────────
 # Holds (request_id, instruction) tuples, not bare strings — the request_id is what lets a
@@ -1188,8 +1211,8 @@ def _free_table_spot(moving_key: str, from_pos) -> np.ndarray:
     good, roomiest, best_room = [], None, -1.0
     for x in np.arange(CUBE_RANDOM_X_RANGE[0], CUBE_RANDOM_X_RANGE[1] + 1e-6, 0.03):
         for y in np.arange(CUBE_RANDOM_Y_RANGE[0], CUBE_RANDOM_Y_RANGE[1] + 1e-6, 0.03):
-            if math.hypot(x, y) > CUBE_MAX_RADIUS_M:
-                continue                                   # beyond what the downward hand can grasp
+            if not (CUBE_MIN_RADIUS_M <= math.hypot(x, y) <= CUBE_MAX_RADIUS_M):
+                continue                                   # outside what the downward hand can grasp (too close folds the wrist to its limit)
             cube_room = min([math.hypot(x - o[0], y - o[1]) for o in others] or [1.0])
             tray_room = _tray_distance(x, y)
             d = math.hypot(x - from_pos[0], y - from_pos[1])
@@ -2001,7 +2024,7 @@ try:
             _drain_command_queue()  # catches anything queued between /hard_stop and this frame
             with telemetry_lock:
                 sim_telemetry["stage"] = "HARD STOP — HOMING & RESETTING PROPS"
-            pick_place_controller.reset()
+            _controller_reset()
             robot.gripper.open()  # don't leave a mid-grasp gripper physically closed across a hard stop
             reset_scene_cubes()
             articulation_controller.apply_action(ArticulationAction(joint_positions=HOME_JOINTS))
@@ -2038,7 +2061,7 @@ try:
                     sim_telemetry["stage"] = "HOMING & RESETTING PROPS"
                 reset_scene_cubes()
                 held_object_key = None
-                pick_place_controller.reset()
+                _controller_reset()
                 robot.gripper.open()  # same fix as hard_stop — don't carry a closed gripper across resets
                 articulation_controller.apply_action(ArticulationAction(joint_positions=HOME_JOINTS))
                 with telemetry_lock:
@@ -2051,7 +2074,7 @@ try:
                 with telemetry_lock:
                     sim_telemetry["stage"] = "RETURNING TO HOME POSE"
                 held_object_key = None
-                pick_place_controller.reset()
+                _controller_reset()
                 robot.gripper.open()
                 articulation_controller.apply_action(ArticulationAction(joint_positions=HOME_JOINTS))
                 with telemetry_lock:
@@ -2089,7 +2112,7 @@ try:
                     # not duplicated here.
                     matched_target, picking_position, placing_position, target_name, reference_key = resolve_pick_place_targets(cmd)
 
-                    pick_place_controller.reset()
+                    _controller_reset()
                     # pick_place_controller.reset() only resets the state machine's phase/timer —
                     # it does NOT physically command the gripper open. If the PREVIOUS task ended
                     # via the early grasp-fail abort below (rather than completing phase 7
@@ -2105,9 +2128,9 @@ try:
                     # during Phase 1 tuning, before obstacles were registered at all). If this
                     # is a "stack on top of X" placement, X must be disabled too — otherwise
                     # RMPFlow treats the intended landing spot as an obstacle to avoid touching.
-                    for key, cube_obj in CUBE_OBJECTS.items():
+                    for key, cube_obj in (CUBE_OBJECTS.items() if CUBE_OBSTACLES else ()):
                         try:
-                            if (not CUBE_OBSTACLES) or key == matched_target or key == reference_key:
+                            if key == matched_target or key == reference_key:
                                 rmpflow_motion_policy.disable_obstacle(cube_obj)
                             else:
                                 rmpflow_motion_policy.enable_obstacle(cube_obj)
@@ -2192,7 +2215,7 @@ try:
                     # just at the next task's start) means a live /state read between tasks
                     # also shows a physically-consistent open gripper, not a stale closed one.
                     robot.gripper.open()
-                    pick_place_controller.reset()
+                    _controller_reset()
                     start_pos = active_pick_place["picking_position"]
                     try:
                         final_pos = fresh_decision_pos(active_pick_place["matched_target"])
@@ -2206,10 +2229,14 @@ try:
                             round(displacement_m * 1000.0, 1) if displacement_m is not None else None)
                     episode_recorder.end_episode(False)  # early grasp-fail abort — drop the episode
                     try:
+                        if not CUBE_OBSTACLES:
+                            raise StopIteration     # cubes are not registered in this mode: nothing to re-enable
                         rmpflow_motion_policy.enable_obstacle(CUBE_OBJECTS[active_pick_place["matched_target"]])
                         ref_key = active_pick_place.get("reference_key")
                         if ref_key is not None:
                             rmpflow_motion_policy.enable_obstacle(CUBE_OBJECTS[ref_key])
+                    except StopIteration:
+                        pass
                     except Exception as e:
                         print(f"[WARN] Could not re-enable obstacle after early grasp-fail abort: {e}", flush=True)
                     active_pick_place = None
@@ -2385,10 +2412,14 @@ try:
                 # Re-enable the just-placed cube (and, if this was a stacking placement, the
                 # reference cube it was placed onto) as obstacles now that the task is done.
                 try:
+                    if not CUBE_OBSTACLES:
+                        raise StopIteration         # cubes are not registered in this mode: nothing to re-enable
                     rmpflow_motion_policy.enable_obstacle(CUBE_OBJECTS[active_pick_place["matched_target"]])
                     ref_key = active_pick_place.get("reference_key")
                     if ref_key is not None:
                         rmpflow_motion_policy.enable_obstacle(CUBE_OBJECTS[ref_key])
+                except StopIteration:
+                    pass
                 except Exception as e:
                     print(f"[WARN] Could not re-enable obstacle after task: {e}", flush=True)
                 active_pick_place = None

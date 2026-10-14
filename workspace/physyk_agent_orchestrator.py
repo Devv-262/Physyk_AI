@@ -98,9 +98,12 @@ class PhysicalWorkspaceRails:
     y_max: float = 0.45
     z_min: float = -0.01     # a cube centre rests at 0.025 but can sink a few mm into the table; below ~0 is a real error
     z_max: float = 0.50
+    r_min: float = 0.36      # closer to the robot base than this the arm folds until joint 6 hits its limit: the grasp fails
 
     def validate_cartesian_target(self, target_xyz, check_z: bool = True) -> Tuple[bool, str]:
         x, y, z = float(target_xyz[0]), float(target_xyz[1]), float(target_xyz[2])
+        if math.hypot(x, y) < self.r_min:
+            return False, f"target is too close to the robot base (radius {math.hypot(x, y):.2f} m, minimum {self.r_min} m): the hand pointing down cannot reach it"
         if not (self.x_min <= x <= self.x_max):
             return False, f"X-target {x:.3f}m out of bounds [{self.x_min}, {self.x_max}]"
         if not (self.y_min <= y <= self.y_max):
@@ -408,7 +411,8 @@ def _ease(scene: Dict[str, Any], k: str) -> float:
     p = _cube_pos(scene, k)
     crowd = sum(1 for o in _cube_keys(scene) if o != k and _cube_pos(scene, o) is not None
                 and math.hypot(_cube_pos(scene, o)[0] - p[0], _cube_pos(scene, o)[1] - p[1]) < 0.11)
-    return (1.0 if _cube_on_top_of(k, scene) else 0.0) * 10.0 + math.hypot(p[0], p[1]) + 0.08 * crowd
+    near_base = 5.0 if math.hypot(p[0], p[1]) < 0.40 else 0.0     # a pile near the base needs the wrist at its limit
+    return (1.0 if _cube_on_top_of(k, scene) else 0.0) * 10.0 + math.hypot(p[0], p[1]) + 0.08 * crowd + near_base
 
 
 TRAY_XY = (0.42, -0.32)
