@@ -29,6 +29,9 @@ Environment switches (speed, obstacles, trace, seed, ...) are in the `README.md`
 | Test tools (end-to-end batch, arm physics harness) | `workspace/scripts/arm_tests/` (see its README) |
 | Docs | `HISTORY.md` (earlier setups and what was removed), `README.md` (overview + env table), `HOW_IT_WORKS.md` (plain English), `ARCHITECTURE.md`, `TECHNICAL_DEEP_DIVE.md` (**§1.8 arm physics, §5 current challenges**), `PERCEPTION.md`, `cosmos_integration.md`, `instructions.md` (run guide), `PROJECT_NARRATIVE.md` |
 
+The repo was cleaned on 2026-10-14: only what is needed to run, test and document the cube/tray lab remains (the earlier scripts, the learned-policy
+experiment and the glassware assets are in git history; `HISTORY.md` records them). Do not re-add them.
+
 Read `README.md` and `TECHNICAL_DEEP_DIVE.md` §5 first in a new session. Keep the docs in sync when behaviour changes, and keep them
 plain, honest and limited to what the code does now (no VLA / GR00T / glassware material on this branch's docs).
 
