@@ -210,10 +210,12 @@ Physyk_AI/
 - It works for **three coloured cubes on a known table and tray**, under the default lighting. It is not a
   general object finder.
 - The tray and table are assumed fixed.
-- Some internal parts still rely on the simulator, for example the planner's obstacle map, the gripper sensor
-  and the touch detection used to release a cube.
-- Cubes are only reachable within about 0.66 m of the robot; the hand points straight down and cannot grasp further out.
-- Picks are verified on single runs and short sequences, not over a large randomised batch. Two cubes touching each
+- Some internal parts still rely on the simulator, for example the gripper's finger-width sensor and the touch detection used to
+  release a cube.
+- Cubes can only be grasped between about 0.38 m and 0.66 m from the robot; the hand points straight down. Closer than about 0.36 m the agent refuses the step, because the wrist runs into its limit.
+- The arm's elbow posture is not controlled; it settles wherever the motion planner puts it. Rare joint swings were seen once and are not fully explained (`TECHNICAL_DEEP_DIVE.md` §5).
+- The motion planner does not avoid the table, tray or other cubes (obstacle avoidance made results worse); the arm stays above them and goes straight down.
+- The latest end-to-end run passed 24 of 25 picks on 10 random layouts; a larger batch has not been run. Two cubes touching each
   other has not been tested.
 
 ---

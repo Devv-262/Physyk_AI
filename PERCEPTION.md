@@ -45,7 +45,7 @@ The GUI switch calls `POST /perception_mode` on the backend, which calls `POST /
   (tray: `fixed calibration`), so Nemotron's scene description, the guardrails, the already-done and drift
   checks all use camera positions.
 - Still simulator-side by design: the randomize/reset commands, the motion planner's internal collision
-  model (RMPFlow reads the sim's obstacle transforms), and the gripper's own width sensor (grasp
+  model (none is registered by default), and the gripper's own width sensor (grasp
   confirmation). The `stage_pos_m` / `delta_mm` fields in `/perception` are a **scoring readout only** and are
   never consulted for decisions in pure mode.
 

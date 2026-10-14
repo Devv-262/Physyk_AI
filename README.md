@@ -36,8 +36,9 @@ The pick/place controller is NVIDIA's open-loop 10-phase state machine on RMPFlo
 - **Release on contact**: while lowering a cube, the gripper opens as soon as the cube reaches its placing height or stops descending, and holds still while the fingers open. It only fires for a genuine descent.
 - **Lift clearance**: transport starts only once the carried cube clears the top of the highest other cube.
 - **Fingers**: commanded fully open (8 cm) during the approach and whenever the gripper is idle.
-- **Reach limit**: randomize and free-spot search stay within 0.66 m of the robot; the downward-pointing hand cannot grasp further out.
-- Arm drive is the stock Franka one (kp 22918, kd 4584); motion phases run at 1.25x.
+- **Reach limits**: the downward-pointing hand can grasp cubes between about 0.38 m and 0.66 m from the robot base. Randomize and the free-spot search stay inside that, and the agent's guardrail refuses targets closer than 0.36 m (closer, the arm folds until joint 6 reaches its limit and the grasp fails).
+- **No RMPFlow obstacles by default**: the table, tray and cubes are not avoidance obstacles (the arm travels above them and descends vertically); active obstacles made results worse in tests.
+- Arm drive is the stock Franka one (kp 22918, kd 4584 N·m/rad); motion phases run at 1.25x.
 
 ## Requirements
 
@@ -77,13 +78,15 @@ cp .env.example .env      # then add your NVIDIA API key; .env is git-ignored
 | `PHYSYK_SPEEDUP_TRANSIT` / `PHYSYK_SPEEDUP_VERTICAL` | = `PHYSYK_SPEEDUP` | Per-group override (free-space moves / vertical moves). 1.5 and 1.75 made the open-loop controller outrun the arm |
 | `PHYSYK_ARM_KD` | 0 (stock) | Arm joint damping; lower = faster but jerkier |
 | `PHYSYK_ENCODE_EVERY` | 2 | JPEG-encode the camera streams every Nth step (frees time for physics) |
-| `PHYSYK_CUBE_OBSTACLES` | 0 | 1 = other cubes are avoidance obstacles for the arm (no difference seen in tests) |
+| `PHYSYK_ARM_OBSTACLES` | `off` | RMPFlow collision avoidance: `off` = none, `static` = table + tray, `all` = plus the cubes. Obstacles are re-registered after every controller reset. `off` gave the best results (see `TECHNICAL_DEEP_DIVE.md` §1.3); `PHYSYK_CUBE_OBSTACLES=1` is the old spelling of `all` |
+| `PHYSYK_MIN_RADIUS` | 0.38 | Closest distance (m) from the robot base at which Randomize and the free-spot search place cubes; closer picks drive joint 6 into its limit |
+| `PHYSYK_RANDOM_SEED` | unset | Fixes the random layout sequence so test runs are comparable |
 | `PHYSYK_JOINT_TRACE` | 1 | Writes `workspace/joint_trace.csv` (every joint's position, command, velocity, error per step) and `[Joint anomaly]` lines to the sim log; 0 turns it off |
 | `PHYSYK_PROFILE` | off | Prints where each loop iteration's time goes |
 
 ## Tested behaviour
 
-Headless runs with the joint trace on: after the fixes above, every pick in the final runs passed: stacking three cubes in the tray and on the table, on straight and randomly rotated layouts, in deterministic and camera-only mode. Errors were 0.5-11.7 mm from target, 17-30 s per pick; tracking error stayed under 0.02 rad on every joint. Not yet covered: cubes touching each other, and the full Nemotron path on unusual phrasings. If the arm looks erratic, send the `[Joint anomaly]` lines from `docker logs physyk-isaac-sim` and `workspace/joint_trace.csv`.
+Latest end-to-end run on the real sim (default settings, 10 randomized layouts, stacking in the tray and on the table, 25 picks): **24 of 25 passed**, 2.5-6.6 mm from target (one pick missed), about 20 s per pick. The fastest joint reached 0.68 of its velocity cap (no frame at the cap) and no joint came closer than 0.28 rad to its limit. The one miss was a misaligned grip (finger width 40 mm instead of 53 mm) on a cube turned 36°. Earlier on identical layouts: obstacles off 14/15, table + tray obstacles on 12/15. Open problems are listed in `TECHNICAL_DEEP_DIVE.md` §5. Not yet covered: cubes touching each other, and the full Nemotron path on unusual phrasings. If the arm looks wrong, send the `[Joint anomaly]` lines from `docker logs physyk-isaac-sim`, `workspace/joint_trace.csv` and the prompt used.
 
 ## Repository layout
 
@@ -107,14 +110,6 @@ Headless runs with the joint trace on: after the fixes above, every pick in the 
 | `cosmos_integration.md` | How Cosmos is deployed and used |
 | `PROJECT_NARRATIVE.md` | The project write-up: objectives, capabilities, challenges and how they were fixed |
 | `INDUSTRY_APPLICATIONS.md` | Where this applies, and Q&A prep |
-
-## Parked and unused code
-
-`workspace/` still holds code that the running system does not need. It is not documented and is a candidate for removal:
-
-- **GR00T / VLA experiment (parked):** `groot_policy_service.py`, `vla_policy_server.py`, `start_groot.sh`, `Isaac-GR00T/`, `scripts/convert_raw_episodes_to_lerobot.py`, `scripts/generate_finetune_episodes.py`, and the `vla:` prompt path, the VLA client and the episode recorder inside `isaac_sim_service.py`. `vla:` prompts are rejected by the backend.
-- **Earlier setups and one-off tests** that no launcher or module references: `physyk_pipeline.py`, `physyk_franka_sim.py`, `physyk_milestone1.py`, `physyk_web_server.py`, `load_franka_scene.py`, `interactive_agent_tester.py`, `verify_system_rigorous.py`, `test_cam.py`, `test_sim_camera.py`, `test_physyk_franka.py`, `physyk_lula_controller.py`.
-- **Retired cloud-VM / local-vLLM scripts:** `nemotron_fastapi_server.py`, `start_nemotron.sh`, `nemotron_watchdog.sh`, `scripts/01_serve_cosmos.sh`.
 
 ## Notes
 

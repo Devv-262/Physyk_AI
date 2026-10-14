@@ -76,7 +76,7 @@ phrasings the planner doesn't recognise still go to it, with the same rules in i
 Three things: (1) the `PickPlaceController` path with RMPFlow's collision-aware planning transfers most directly, but the
 closed-loop additions here (wait for arrival, lift clearance, release on contact) rely on simulator signals, such as the
 cube's pose for contact, that a real arm would replace with force or gripper-width sensing; (2) a real camera needs real
-calibration, and the obstacle registration has to be re-validated against real geometry; (3) the colour-based detector is
+calibration, and the arm's clearance rules (carry height, vertical descents) have to be re-validated against real geometry; (3) the colour-based detector is
 tuned to this scene, so a real deployment would swap in a general detector.
 
 **"Why Nemotron specifically, and why Cosmos for perception?"**

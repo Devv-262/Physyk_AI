@@ -107,7 +107,7 @@ flowchart TD
     F4 --> G
 
     G --> Y["_plan_grip_yaws(): hand yaw at the pick (cube faces,\nclear of neighbours) and at the place (pile / world aligned)"]
-    Y --> H["pick_place_controller.reset(); disable target + reference\nas RMPFlow obstacles (other cubes: off by default);\ntable + tray stay obstacles"]
+    Y --> H["_controller_reset(): pick_place_controller.reset()\n(clears RMPFlow obstacles), then re-register per\nPHYSYK_ARM_OBSTACLES (default off: none)"]
     H --> I["active_pick_place = {...}\nsim_telemetry.busy = True"]
 
     I --> J["every sim frame:\nforward(picking, placing, joints, rotated EE offset,\nhand orientation Rz(yaw)*Ry(pi))"]
@@ -130,7 +130,7 @@ flowchart TD
     M --> N{"within tolerance?"}
     N -- "yes" --> O1["last_task_success = True\nlast_task_error_mm = err_xy"]
     N -- "no" --> O2["last_task_success = False"]
-    O1 --> Q["re-enable obstacles\nactive_pick_place = None, busy = False\nstage = READY"]
+    O1 --> Q["active_pick_place = None, busy = False\nstage = READY"]
     O2 --> Q
 ```
 
@@ -323,10 +323,12 @@ last_grasp_confirmed, last_object_displacement_mm, objects
 
 ## 6. Known gaps (honest)
 
-- **Reach:** the hand points straight down; cubes further than ~0.66 m from the robot cannot be grasped. Randomize and the free-spot
-  search stay inside that.
-- **Erratic motion** was reported once on table stacking and not reproduced in headless runs (deterministic and camera-only,
-  straight and rotated cubes). The sim writes `workspace/joint_trace.csv` and `[Joint anomaly]` log lines to catch it.
+- **Reach:** the hand points straight down; cubes between about 0.38 m and 0.66 m from the base can be grasped. Closer, the wrist reaches
+  its joint limit and the grasp fails, so Randomize and the free-spot search stay inside that range and the guardrail refuses targets
+  closer than 0.36 m.
+- **Arm posture and rare swings:** the elbow posture is not controlled, and one joint swing was seen live and only reproduced offline under
+  specific conditions. Details and what is known: `TECHNICAL_DEEP_DIVE.md` §5. The sim writes `workspace/joint_trace.csv` and
+  `[Joint anomaly]` log lines to catch it.
 - **Cubes touching** each other: the hand picks the finger angle that sweeps clear of neighbours, but this is untested on a
   touching pair.
 - **Pure perception** is scoped to three coloured cubes on the known table, studio lighting; the tray is a fixed constant.
@@ -335,6 +337,5 @@ last_grasp_confirmed, last_object_displacement_mm, objects
 - **Speed:** wall time is set by the loop rate, because the controller counts phases per loop iteration. The loop runs at
   ~40 iterations/s (the duplicate render is skipped, two cameras remain, JPEGs are encoded every 2nd step); a pick takes 17-20 s,
   22-30 s in camera-only mode. Raising the phase speed-ups to 1.5-1.9x made picks miss. On battery the GPU is power-capped.
-- No N-trial randomized batch success rate has been measured yet.
+- Latest end-to-end run: 24 of 25 picks passed on 10 random layouts (default settings).
 - Cosmos is not started/stopped by `run.sh` (use `start_cosmos_docker.sh`).
-- Dead or parked code remains in `workspace/` (see the list in `README.md`).

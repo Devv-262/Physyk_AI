@@ -33,7 +33,7 @@ its own work, and recover when something goes wrong?
 - **Physics simulation** — a Franka Panda arm in NVIDIA Isaac Sim, with real gravity, contact and friction, on a lab scene.
 - **Deterministic control** — a validated 10-phase grasp-and-place state machine, with closed-loop additions: it waits for
   the hand to arrive, lifts clear of other cubes, releases on contact, and turns the hand to the cube's faces.
-- **Motion planning** — RMPFlow generates collision-aware joint targets around the table and tray.
+- **Motion planning** — RMPFlow generates the joint targets; avoidance of the table, tray and cubes is off by default because enabling it made results worse.
 - **Pure perception mode** — a GUI switch that finds the cubes *by looking* through the overview camera (colour
   segmentation + depth, ~20 ms) instead of reading simulator coordinates. The arm, the agent and the outcome check then
   use only camera positions. See `PERCEPTION.md`.
@@ -112,8 +112,10 @@ Real problems hit and (mostly) fixed along the way — kept here honestly rather
 
 - **One-fingered grasp bug** — one of the gripper's two fingers shipped with zero drive strength, so only one finger ever
   closed. Fixed at the gain level.
-- **Blind motion planner** — the planner didn't know about the table, tray or other cubes for a long stretch, so the arm
-  could clip through them. Fixed by registering real collision obstacles.
+- **Blind motion planner, then the opposite problem** — the planner didn't know about the table, tray or other cubes, so the arm could
+  clip through them. Registering obstacles seemed to fix it, but the controller's reset silently cleared them, so they were never active;
+  when they were made active, results got worse (12/15 vs 14/15 picks on identical layouts). The arm now runs with no avoidance and relies
+  on carry height and vertical descents.
 - **Grasp timing** — the gripper started to lift before it had finished closing, so it grabbed an edge and slipped. Fixed
   by giving the close/settle phases real time.
 - **Camera framing** — cameras originally missed the table edges and cropped the robot out of frame. Fixed by repositioning
@@ -145,3 +147,7 @@ Real problems hit and (mostly) fixed along the way — kept here honestly rather
   Solved by running the official Isaac Sim 6.0.1 container.
 - **Cosmos 3 doesn't fit next to the sim by default** — the NIM's defaults crash on a 24 GB laptop GPU shared with Isaac
   Sim. Fixed with the FP8 build, an 8192-token context, a 65% GPU share and CUDA graphs off.
+- **A pick too close to the base** — a cube spawned 0.33 m from the base drove joint 6 into its limit and the grasp failed. Cubes now
+  stay 0.38-0.66 m from the base and the agent refuses closer targets.
+- **Arm posture and rare swings (open)** — the elbow posture is not controlled and one joint swing was seen that only reproduces under
+  specific conditions; see `TECHNICAL_DEEP_DIVE.md` §5.

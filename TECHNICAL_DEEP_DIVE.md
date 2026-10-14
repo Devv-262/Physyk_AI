@@ -54,9 +54,9 @@ Two details worth knowing:
 - **RMPFlow**, via `PickPlaceController._cspace_controller`, computes every joint target. `MotionPolicyController.forward`
   calls `update_world()` on every step, so the poses of the dynamic obstacles stay current.
 
-### 1.3 Collision avoidance — RMPFlow obstacles
+### 1.3 Collision avoidance — RMPFlow obstacles (off by default)
 
-Obstacles must be registered explicitly (`isaac_sim_service.py`, "Register Real Collision Obstacles"):
+RMPFlow only avoids obstacles that have been registered with it:
 
 ```python
 rmpflow_motion_policy.add_obstacle(work_table_obj, static=True)
@@ -65,11 +65,24 @@ for cube_obj in CUBE_OBJECTS.values():
     rmpflow_motion_policy.add_obstacle(cube_obj, static=False)
 ```
 
-The table and tray are permanent static obstacles. The cubes are registered as dynamic obstacles, but **by default they are
-disabled for the duration of every task** (`PHYSYK_CUBE_OBSTACLES=1` keeps the non-target cubes enabled): the arm already
-travels well above the cubes and descends vertically, and the hand yaw (§1.4) is chosen to keep the fingers clear of
-neighbours. Headless A/B runs (table stacking next to a free cube, straight and rotated, deterministic and camera-only)
-showed no difference between the two settings. Without registered obstacles at all, an early version clipped through the table.
+**`PickPlaceController.reset()` clears every registered obstacle** (measured: 2 static obstacles registered, 0 after the reset, and a
+trajectory identical to one with none). The sim used to register them once at startup and reset the controller at the start of every
+task, so they were wiped before the first task and never active. The obstacles are now re-registered after every reset
+(`_controller_reset()`), and `PHYSYK_ARM_OBSTACLES` selects what is registered: `off` (default), `static` (table + tray) or `all`
+(plus the cubes; the cube being picked and the one stacked onto are disabled for the task).
+
+End-to-end results on the real sim, six seeded random layouts (15 picks per mode, identical layouts):
+
+| Mode | Picks passed | Fastest joint vs its cap | Failures |
+|---|---|---|---|
+| `off` | 14 / 15 | 1.29× on one pick | one pick at 0.33 m radius (joint 6 at its limit; fixed by the reach minimum) |
+| `static` | 12 / 15 | 1.00× for 14 frames | three more failures, one 664 mm off |
+| `all` | 2 / 5 (stopped) | — | failures of 625, 179 and 110 mm |
+
+Offline, the combination that swung joints 1-6 to 93-99% of their velocity cap was table + tray obstacles registered after the reset plus
+a hand-yaw command. So the default is **no avoidance**: the arm travels well above the cubes (hand centre ≥ 0.2 m), descends
+vertically, and the hand yaw (§1.4) is chosen to keep the fingers clear of neighbours. The consequence is that RMPFlow does not
+protect the table or tray; clearance there rests on the carry height and the vertical descent.
 
 ### 1.4 Hand orientation
 
@@ -128,6 +141,54 @@ phase time, hand yaw, joints 1-7 (position, commanded target, velocity, error), 
 positions. It also prints `[Joint anomaly] <cube> phase <n> …` lines to the sim log when joints 2-6 show a tracking error over
 0.06 rad or a velocity kick over 0.6 rad/s in one iteration, with the hand height and all seven joint angles. Typical runs show
 none; one camera-only run showed a single 0.67 rad/s kick on joint 2.
+
+---
+
+### 1.8 Arm physics reference and how the arm behaves
+
+**Measured from `franka.usd` as the sim loads it (Isaac Sim 6.0.1):**
+
+| Setting | Value |
+|---|---|
+| Drive stiffness / damping (all 7 arm joints) | 400 / 80 N·m per degree = **22,918 / 4,584 N·m per rad**; kd/kp = 0.2 s |
+| Effort limits | 87 N·m (joints 1-4), 12 N·m (joints 5-7) |
+| Velocity caps (`physxJoint:maxJointVelocity`) | 2.175 rad/s (joints 1-4), 2.61 rad/s (joints 5-7) |
+| Joint limits (rad) | j1 ±2.897, j2 ±1.763, j3 ±2.897, j4 −3.072..−0.070, j5 ±2.897, j6 −0.018..3.753, j7 ±2.897 |
+| Armature, joint friction | 0, 0 |
+| Articulation solver / scene | 32 position / 1 velocity iterations; scene TGS, 16/4 minimum iterations, CCD on, 60 Hz; self-collision off |
+| Link masses / inertias | 18.0 kg total; link inertias about 1e-6 kg·m² (I recall the real arm's published values are around 1e-2; not verified) |
+
+With such small inertias the drive behaves as an **over-damped velocity servo** (joint velocity ≈ 5 s⁻¹ × position error): there is no
+momentum to overshoot with. Franka's rated limits (`assets/franka_panda/robots/panda/joint_limits.yaml`, NVIDIA's
+`franka_rmpflow_common.yaml` / `robot_descriptor.yaml`): velocity 2.175 / 2.61 rad/s, acceleration [15, 7.5, 10, 12.5, 15, 20, 20] rad/s²,
+jerk [7500, 3750, 5000, 6250, 7500, 10000, 10000] rad/s³.
+
+**NVIDIA reference configurations** (found in the Isaac Sim container and the public Isaac Lab repo):
+
+| Source | What it sets |
+|---|---|
+| `motion_policy_configs/franka/rmpflow/` | RMPFlow params: joint velocity cap **4 rad/s** (above the arm's real 2.175), `max_acceleration_norm` 50, target gains p 30 / d 85, orientation (axis target) gains 210 / 60, collision repulsion 800, `maximum_substep_size` 0.00334 s, `default_q` [0, −1.3, 0, −2.87, 0, 2.0, 0.75] |
+| Franka `PickPlaceController` defaults | `events_dt` [0.008, 0.005, 1, 0.1, 0.05, 0.05, 0.0025, 1, 0.008, 0.08] (1-step settle, 10-step close); ours: settle 0.2, close 0.04, motion phases ×1.25 |
+| Isaac Lab `FRANKA_PANDA_CFG` | stiffness 80 / damping 4 per rad (kd/kp 0.05 s), effort 87/12, solver iterations 8/0, self-collision on |
+| Isaac Lab `FRANKA_PANDA_HIGH_PD_CFG` | 400 / 80 per rad (kd/kp 0.2 s, 57× softer than ours), gravity disabled |
+
+Isaac Sim ships no separate arm gain file: the gains live in `franka.usd`.
+
+**Measured behaviour** (instrumented runs with every step logged: controller phase, joints, RMPFlow's commanded positions and velocities,
+hand and target positions):
+
+- RMPFlow's commanded joint velocities never exceeded the Franka caps in normal picks (peak 0.98 rad/s), the achieved velocity matches the
+  command, and the commanded-vs-actual position error stays ≤ 0.011 rad. The arm follows RMPFlow almost exactly.
+- The lag is in the controller's **timer**, not the drive. The controller moves its Cartesian target on a fixed schedule: at the end of the
+  lift the hand is 13 cm below the 0.30 m target; in transport the target jumps to the destination (49 cm away) and the hand needs about 160
+  steps (2.7 s), while the phase is allotted 16 (0.27 s). The approach needs ~15 extra steps; the descents stay within 0.1-1 cm.
+- Phase timing against NVIDIA's plain controller: joints 1-6 stay at ~0.35 of their cap at 1.0-1.5× speed; at 2.0× the grasp fails. Lower
+  damping (kd 1500, or 0.15× stock) raised frames over the rated acceleration from 2.7% to 4.4-6.1%; doubled damping, doubled stiffness and
+  Isaac-Lab-like soft gains did not help. Stock gains and 1.25× are the smoothest settings tested.
+- Joint 7 kicks to 0.5-1.0 of its cap (8-15× the rated acceleration) while the gripper closes and the cube is lifted, in every
+  configuration. RMPFlow commands nothing during settle/close/release, so this is the contact reaction.
+- Lowering RMPFlow's own velocity cap to 1.5-2.0 rad/s removes any swing but the arm then falls behind the open-loop timers and the grasp
+  fails; it only works together with an arrival check on every phase (not implemented).
 
 ---
 
@@ -242,3 +303,33 @@ cube has not been tested against it.
 | Start | `./start_sim_docker.sh`, then `./run.sh` (Cosmos: `./start_cosmos_docker.sh`) |
 | Scripted-path only (no Nemotron) | `./run.sh --no-agent` |
 | Status | `./run.sh --status` |
+
+---
+
+## 5. Current challenges
+
+Open problems, with what is known about each.
+
+1. **Arm posture (elbow) is not controlled.** The arm has 7 joints for a 6-degree task, and RMPFlow settles into whatever posture its
+   defaults favour; nothing in Physyk sets it. The reported impression is that the elbow points outwards when picking the first cube. From
+   forward kinematics of the recorded joint angles, a normal first pick has the elbow high and tucked in the vertical plane through the
+   base and the cube (1.6-2 cm sideways at the end of the approach and at the grasp); it flares sideways (about 12 cm) only in the
+   swing case in item 2. This has not been reproduced on screen. The fix would be a preferred joint pose for RMPFlow's null space
+   (`set_cspace_target`); it is not implemented and not tested.
+2. **Rare erratic swing of joints 1-6.** One live pick drove joints 1-3 to the velocity cap (2.17 rad/s) with the hand almost still (the
+   elbow swivelling), at up to 3.9× the rated acceleration. Offline it reproduced only with table + tray obstacles active and a hand yaw
+   that did not match the cube's turn (93-99% of cap for 52-63 frames), and depends sensitively on the yaw angle and the move; it did not
+   appear with the cube aligned to the hand, nor in the 25 picks of the latest end-to-end run. The cause is in how RMPFlow resolves the
+   orientation target, not in the arm's drive.
+3. **Near-base reach.** A pick at 0.33 m radius drove joint 6 to 3.76 rad (limit 3.7525) and failed; every good pick kept joint 6 at least
+   0.76 rad away. Cubes are now kept 0.38-0.66 m from the base and the agent refuses targets closer than 0.36 m. Placement heights near
+   the base are not specifically checked.
+4. **Open-loop controller timing.** Only the approach and transport phases wait for the hand to arrive; the others rely on timers that were
+   tuned for a faster arm. Raising the speed-ups (1.5× and above) or lowering RMPFlow's velocity cap makes the timers outrun the arm.
+5. **Joint 7 kick when the gripper closes** (item in §1.8). Harmless so far but 8-15× the rated acceleration.
+6. **No table or tray avoidance.** With obstacles off RMPFlow does not protect them; with them on the results were worse (§1.3).
+7. **Residual grasp misses.** One of 25 picks (cube turned 36°, finger width 40 mm instead of 53 mm); cause not isolated.
+8. **Not yet tested:** two cubes touching each other; a large randomized batch beyond 25 picks; the cube colour thresholds on the lab
+   background (they were rebuilt from measured values); the full Nemotron path on unusual stacking phrasings.
+9. **Sim startup hang.** Roughly one start in five hangs with an empty log and an "unhealthy" container; `docker rm -f physyk-isaac-sim` and
+   starting again fixes it.

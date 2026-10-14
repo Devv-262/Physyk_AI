@@ -69,8 +69,8 @@ code, just run `./run.sh` again.
 
 ### Sim tuning (all optional environment variables)
 
-See the table in `README.md` (`PHYSYK_SPEEDUP*`, `PHYSYK_ARM_KD`, `PHYSYK_ENCODE_EVERY`, `PHYSYK_CUBE_OBSTACLES`,
-`PHYSYK_JOINT_TRACE`, `PHYSYK_PROFILE`). Set them in front of the command, e.g. `PHYSYK_PROFILE=1 ./start_sim_docker.sh`.
+See the table in `README.md` (`PHYSYK_SPEEDUP*`, `PHYSYK_ARM_KD`, `PHYSYK_ENCODE_EVERY`, `PHYSYK_ARM_OBSTACLES`,
+`PHYSYK_MIN_RADIUS`, `PHYSYK_RANDOM_SEED`, `PHYSYK_JOINT_TRACE`, `PHYSYK_PROFILE`). Set them in front of the command, e.g. `PHYSYK_PROFILE=1 ./start_sim_docker.sh`.
 
 ## Using the GUI
 
@@ -125,7 +125,7 @@ nvidia-smi
   `workspace/joint_trace.csv` (written by default; every joint's position, command, velocity and error per step of a pick), plus the prompt used.
 - **A pick misses or the arm outruns itself** — leave the speed-ups at the default 1.25; higher values made the open-loop controller
   outrun the arm.
-- **Sim hangs at startup with an empty log** — intermittent; `docker rm -f physyk-isaac-sim` and start it again.
+- **Sim hangs at startup with an empty log / the container stays "unhealthy"** — intermittent (about one start in five); `docker rm -f physyk-isaac-sim` and start it again.
 - **Cosmos won't start** — see `logs/cosmos.log`; usually GPU memory (stop the sim first, or lower `COSMOS_GPU_UTIL`).
 - **Nemotron errors / "planning failed"** — check `.env`; without a working key each prompt falls back to a
   single direct command.
@@ -133,6 +133,7 @@ nvidia-smi
   cubes within 0.66 m of the robot and Y from -0.15 to 0.42; restart the sim to pick this up.
 - **"target object ... not found in live scene" in pure-perception mode** — the camera did not see that cube (it can be hidden by the
   arm or another cube). The guardrail re-observes up to 3 times; if it persists, `randomize` or switch the perception switch off.
+- **"target is too close to the robot base (radius ... m, minimum 0.36 m)"** — the cube is closer to the robot than the downward hand can reach (the wrist hits its joint limit). Move it with `randomize` (which keeps cubes 0.38-0.66 m from the base) or `reset`.
 - **"there is no free spot on the table ..."** — the agent needed to move a blocking cube but the table is too crowded for a spot with
   room for the hand; `reset` or `randomize` first.
 - **Perception mode rejects a step ("Z-target … out of bounds")** — the orchestrator re-observes up to 3 times
