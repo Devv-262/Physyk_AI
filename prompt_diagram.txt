@@ -2,47 +2,37 @@ Create a clean, professional architecture diagram for a technical presentation s
 
 Title at top: "Physyk — Pick-and-Place Execution"
 
-Content to depict: A robotic pick-and-place system where a natural-language instruction splits into two parallel execution paths that both drive the same physical robot arm, then converge on one verification step.
+Content to depict: a natural-language instruction becomes a plan, then a physical pick-and-place with closed-loop rules around NVIDIA's open-loop controller, then a verification step that feeds back into the plan.
 
-Layout — left to right, then converging downward:
+Layout — left to right, one main lane, with a feedback arrow underneath:
 
-1. Leftmost box: "Instruction" (example text below it: "pick up the red cube and place it in the tray")
-2. From that box, two arrows branch outward to two horizontal lanes:
-
-Top lane — labeled "PickPlaceController — default, deterministic" (solid black boxes, solid arrows):
-- Box: "Keyword match — resolve_pick_place_targets()"
-- arrow →
-- Box: "10-phase grasp state machine (NVIDIA PickPlaceController)"
-- arrow →
-- Box: "RMPFlow cspace controller → joint targets"
-
-Bottom lane — labeled "GR00T-N1.7 VLA — experimental, opt-in (triggered by a 'vla:' prefix)" (dashed orange/amber boxes, dashed orange arrows, visually distinct from the top lane):
-- Box: "Camera frames (scene + wrist) + EE pose — observation"
-- arrow →
-- Box: "GR00T-N1.7-LIBERO policy (groot_policy_service.py, port 8300)"
-- arrow →
-- Box: "16-step action chunk (x, y, z, roll, pitch, yaw, gripper)"
-- A curved dashed arrow loops from this last box back to the first box in this lane, labeled "re-observe every chunk (max 4 chunks per task)" — this shows the closed-loop nature of the VLA path.
-
-3. Both lanes' final boxes have arrows pointing down into one shared wide box: "Franka Panda arm — PhysX @ 60Hz" (subtitle: "isaac_sim_service.py sim loop — shared by both paths")
-
-4. One more arrow down from that shared box into a final box: "Live position verification" (subtitle: "real sim telemetry compared to target — not a scripted PASS")
+1. Leftmost box: "Instruction" (example text below it: "stack the cubes in the tray")
+2. Arrow to "Planner" (subtitle: "Stack planner (code) or Nemotron") then arrow to "Guardrails + blocker check" (subtitle: "workspace limits; clear a cube on top first")
+3. Arrow to a wide box "Pick-and-place (Isaac Sim, PhysX 60 Hz)" containing the 10-phase strip in small boxes:
+   "above target → descend → settle → close → lift → transport → descend → release → ascend → return"
+   Under that strip, three small tagged boxes attached to the strip:
+   - "Hand yaw: turn to the cube's faces, clear of neighbours" (under descend / close)
+   - "Wait for arrival (1.5 cm) + lift clearance" (under lift / transport)
+   - "Release on contact" (under the second descend)
+4. Arrow to "Verification" (subtitle: "real position or fresh camera look + Cosmos second opinion")
+5. A feedback arrow from "Verification" back to "Planner", labelled "retry / re-plan on failure".
 
 Style notes:
-- Use a small legend at the bottom with 3 color swatches: solid gray/black = "default/deterministic path", dashed orange = "experimental VLA path (opt-in)", light gray = "shared physics execution"
+- Solid black boxes and arrows for the main lane; the three closed-loop rules in a light accent colour (e.g. teal) so they read as additions to the standard controller
 - Keep all text short — box titles under 5 words, subtitles under 10 words
-- Use consistent box sizing within each lane, aligned to a grid, generous whitespace, thin 1-2px borders, no drop shadows or gradients
-- Sans-serif font throughout (e.g., Helvetica/Inter style)
-- Landscape orientation, roughly 16:9, designed to fill a presentation slide
+- Consistent box sizing, aligned to a grid, generous whitespace, thin 1-2px borders, no drop shadows or gradients
+- Small legend at the bottom: black = "standard pipeline", teal = "closed-loop additions"
+- Sans-serif font throughout (Helvetica/Inter style)
+- Landscape, roughly 16:9, designed to fill a presentation slide
 
 ---
 
-PPT SLIDE TEXT — Pick-and-Place (6-7 technical, defined lines)
+PPT SLIDE TEXT — Pick-and-Place (7 technical, defined lines)
 
-- Instruction Parsing: extracts the source object and destination target from natural-language commands.
-- Physics Simulation: executes robot motion using a Franka Panda arm in NVIDIA Isaac Sim, with real gravity, contact, and friction.
-- Deterministic Control: a validated 10-phase grasp-and-place state machine is the default execution path.
-- Motion Planning: RMPFlow generates collision-aware joint targets, routing the arm around registered obstacles.
-- Grasp Confirmation: gripper opening width is checked against a minimum threshold after closing, distinguishing a real grasp from closing on empty air.
-- Obstacle Handling: the target object (and, for stacking, the reference object) is temporarily disabled as an obstacle for the duration of its own task, then re-enabled on completion.
-- Outcome Verification: live simulator telemetry — object position and displacement — is compared against the resolved target to determine actual task success, not assumed success.
+- Instruction Parsing: extracts the object and destination from natural language; "stack" is planned from the cubes' positions, easiest cube first.
+- Physics Simulation: a Franka Panda arm in NVIDIA Isaac Sim with real gravity, contact and friction.
+- Deterministic Control: a validated 10-phase grasp-and-place state machine, RMPFlow for collision-aware joint targets.
+- Closed-Loop Rules: waits for the hand to arrive, lifts clear of other cubes, and opens on contact instead of pushing.
+- Hand Alignment: the wrist turns to the cube's faces, choosing the angle whose fingers clear neighbouring cubes.
+- Grasp Confirmation: finger width after closing separates a real grasp from closing on empty air.
+- Outcome Verification: live position (or a fresh camera look) is compared with the target — success is measured, not assumed.

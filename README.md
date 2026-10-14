@@ -90,20 +90,31 @@ Headless runs with the joint trace on: after the fixes above, every pick in the 
 | Path | Contents |
 |---|---|
 | `workspace/` | Backend, orchestrator, sim service, perception, motion control |
-| `workspace/physyk_perception/` | Camera-only cube detection, Cosmos client, step verifier |
+| `workspace/physyk_perception/` | Camera-only cube detection, Cosmos client, step verifier, overlay layout |
 | `assets/` | Franka Panda and scene object assets |
 | `scripts/` | Helper and diagnostic shell scripts |
 | `run.sh`, `start_*_docker.sh` | Launchers |
 
 ## Documentation
 
-- `HOW_IT_WORKS.md` — plain-English walkthrough, no code
-- `ARCHITECTURE.md` and `TECHNICAL_DEEP_DIVE.md` — design details
-- `cosmos_integration.md` — Cosmos setup and use
-- `INDUSTRY_APPLICATIONS.md` — where this applies
-- `PROJECT_NARRATIVE.md` — original project write-up, challenges and history
+| Doc | For |
+|---|---|
+| `HOW_IT_WORKS.md` | Plain-English walkthrough, no code |
+| `instructions.md` | Setup, running, GUI use, troubleshooting |
+| `ARCHITECTURE.md` | Service topology, the pick-and-place flow, the agent loop, state models, known gaps |
+| `TECHNICAL_DEEP_DIVE.md` | Controller phases, hand yaw, closed-loop rules, obstacles, Nemotron prompts, guardrails, Cosmos |
+| `PERCEPTION.md` | The camera-only pipeline: detector, calibration, measurements, limits |
+| `cosmos_integration.md` | How Cosmos is deployed and used |
+| `PROJECT_NARRATIVE.md` | The project write-up: objectives, capabilities, challenges and how they were fixed |
+| `INDUSTRY_APPLICATIONS.md` | Where this applies, and Q&A prep |
 
-`TODO_GRASPING.md` documents the glassware variant on `feature-lab`, not this scene.
+## Parked and unused code
+
+`workspace/` still holds code that the running system does not need. It is not documented and is a candidate for removal:
+
+- **GR00T / VLA experiment (parked):** `groot_policy_service.py`, `vla_policy_server.py`, `start_groot.sh`, `Isaac-GR00T/`, `scripts/convert_raw_episodes_to_lerobot.py`, `scripts/generate_finetune_episodes.py`, and the `vla:` prompt path, the VLA client and the episode recorder inside `isaac_sim_service.py`. `vla:` prompts are rejected by the backend.
+- **Earlier setups and one-off tests** that no launcher or module references: `physyk_pipeline.py`, `physyk_franka_sim.py`, `physyk_milestone1.py`, `physyk_web_server.py`, `load_franka_scene.py`, `interactive_agent_tester.py`, `verify_system_rigorous.py`, `test_cam.py`, `test_sim_camera.py`, `test_physyk_franka.py`, `physyk_lula_controller.py`.
+- **Retired cloud-VM / local-vLLM scripts:** `nemotron_fastapi_server.py`, `start_nemotron.sh`, `nemotron_watchdog.sh`, `scripts/01_serve_cosmos.sh`.
 
 ## Notes
 

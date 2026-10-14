@@ -1,8 +1,7 @@
 # Physyk — Run Guide (local laptop)
 
 Everything runs on this laptop: Isaac Sim in Docker, the backend/GUI in a Python venv, Cosmos as a
-local NIM container, and Nemotron through NVIDIA's hosted API. (This used to run on a Brev cloud VM;
-that setup is retired. GR00T/VLA is parked and not started.)
+local NIM container, and Nemotron through NVIDIA's hosted API.
 
 ## What runs where
 
@@ -43,7 +42,7 @@ the container brings its own userland and only needs the NVIDIA driver.
 # 1. Cosmos (leave running in the background; only needed for Cosmos evidence in the logs)
 ./start_cosmos_docker.sh &
 
-# 2. Isaac Sim, windowed (terminal 1, leave open) — first boot ~1 minute
+# 2. Isaac Sim, headless by default (terminal 1, leave open) — first boot ~1 minute; Ctrl+C stops it
 ./start_sim_docker.sh
 
 # 3. Backend + GUI (terminal 2)
@@ -59,7 +58,7 @@ controls it (below).
 ./run.sh --no-agent         # every prompt goes straight to Isaac Sim (no Nemotron)
 ./run.sh --status           # health of everything
 ./run.sh --stop             # stop the backend only
-docker rm -f physyk-isaac-sim   # stop the sim (or Ctrl+C its terminal)
+docker rm -f physyk-isaac-sim   # stop the sim (Ctrl+C in its terminal also stops the container)
 docker stop physyk-cosmos       # stop Cosmos
 HEADLESS=0 ./start_sim_docker.sh   # sim with a window (default is headless)
 ```
@@ -67,6 +66,11 @@ HEADLESS=0 ./start_sim_docker.sh   # sim with a window (default is headless)
 Notes: `run.sh` starts and stops **only the backend/GUI** — it never launches or stops the sim or Cosmos (it just warns if
 the sim isn't up on :8100). After changing sim code, stop the sim (Ctrl+C) and start it again; after changing backend
 code, just run `./run.sh` again.
+
+### Sim tuning (all optional environment variables)
+
+See the table in `README.md` (`PHYSYK_SPEEDUP*`, `PHYSYK_ARM_KD`, `PHYSYK_ENCODE_EVERY`, `PHYSYK_CUBE_OBSTACLES`,
+`PHYSYK_JOINT_TRACE`, `PHYSYK_PROFILE`). Set them in front of the command, e.g. `PHYSYK_PROFILE=1 ./start_sim_docker.sh`.
 
 ## Using the GUI
 
@@ -79,11 +83,13 @@ code, just run `./run.sh` again.
 - **Logs (top strip)** — `Nemotron Log` (planning reasoning), `Cosmos Log` (pre/post-step visual checks
   with the exact image Cosmos saw), `Perception Log` (annotated camera frames with bounding boxes and
   estimated XYZ for every pre-pick detection and post-place check).
-- Example prompts (the table now holds five glassware objects — blue/red/empty flasks, red/green beakers — and a
-  shelf behind the robot; **picking glassware is not implemented yet**, so today a pick is planned and then refused with
-  a clear message; `randomize` / `reset` shuffle or restore the glassware): `pick up the red flask and put it on the top shelf`.
-  (The earlier cube-era examples, kept for reference:) `pick up the red cube and place it in the tray`;
-  `stack the red cube, the blue cube and the green cube on the tray with red at the bottom, blue in the middle and green on top`.
+- **Example prompts** (the table holds a red, a green and a blue cube and a yellow tray):
+  `pick up the red cube and place it in the tray`; `put the blue cube on top of the green cube`;
+  `put the red cube to the right of the blue cube`; `stack the cubes` (a vertical pile, built from where the cubes are, easiest
+  first — no colour order needed); `stack the cubes in the tray`; `stack the cubes on the table`.
+  The control buttons `randomize` (random positions **and** rotations inside the arm's reach), `reset` (back to the staging spots)
+  and `home` go straight to the sim.
+- The **Isaac Sim** light in the header is ONLINE whenever the `physyk-isaac-sim` container is running, even while the sim is still loading.
 
 ## Scene background
 
@@ -91,6 +97,8 @@ The sim opens in a life-science-lab setting (floor, walls, a bench body with dra
 extended behind the robot, wall shelving and a fume hood). It is **visual only** — no physics, no effect on picking,
 and the work table itself is unchanged. `PHYSYK_BACKGROUND=grid ./start_sim_docker.sh` restores the original blue grid.
 Keep any new background items **neutral (white/grey)**: the colour detector looks for saturated red, green and blue.
+The cube colour thresholds (`workspace/physyk_perception/color_segment.py`) were rebuilt from measured values; re-check them if the
+lighting or background changes.
 
 ## GPU memory (RTX 5090 laptop, 24 GB)
 
@@ -111,20 +119,24 @@ nvidia-smi
 - **Sim window doesn't open / renderer errors** — the cache folder under `.isaac-cache/` must be writable
   by the container (the launcher handles this); check `logs/isaac_sim.log`.
 - **Sim is slow / a pick takes minutes** — first check the laptop is **plugged in**: on battery the GPU is power-capped
-  (~800 of 3090 MHz) and the loop drops to ~3 iterations/s. Normal now: ~40 iterations/s, a pick in ~25 s, the 3-cube
-  stack in ~90 s. `PHYSYK_PROFILE=1 ./start_sim_docker.sh` prints where each frame's time goes.
+  (~800 of 3090 MHz) and the loop drops to ~3 iterations/s. Normal now: ~40 iterations/s, a pick in 17-20 s (22-30 s in
+  camera-only mode), a three-cube stack in about a minute. `PHYSYK_PROFILE=1 ./start_sim_docker.sh` prints where each frame's time goes.
+- **The arm moves erratically** — send the `[Joint anomaly]` lines (`docker logs physyk-isaac-sim | grep "Joint anomaly"`) and
+  `workspace/joint_trace.csv` (written by default; every joint's position, command, velocity and error per step of a pick), plus the prompt used.
+- **A pick misses or the arm outruns itself** — leave the speed-ups at the default 1.25; higher values made the open-loop controller
+  outrun the arm.
 - **Sim hangs at startup with an empty log** — intermittent; `docker rm -f physyk-isaac-sim` and start it again.
 - **Cosmos won't start** — see `logs/cosmos.log`; usually GPU memory (stop the sim first, or lower `COSMOS_GPU_UTIL`).
 - **Nemotron errors / "planning failed"** — check `.env`; without a working key each prompt falls back to a
   single direct command.
-- **"Y-target ... out of bounds [-0.45, 0.45]" right after a randomize** — an object spawned outside the arm's
-  validated reach. Randomize keeps the glassware inside X 0.28-0.64, Y -0.32..0.34 (the old cube range allowed up to
-  0.55); restart the sim to pick this up.
-- **"target object ... not found in live scene" in pure-perception mode** — the camera did not see that object (it can
-  be hidden behind another vessel). Detection is ~99.5% on random layouts; the guardrail re-observes up to 3 times. If
-  it persists, move the objects apart (`randomize`) or switch the perception switch off.
+- **"Y-target ... out of bounds [-0.45, 0.45]" right after a randomize** — an object is outside the arm's validated reach. Randomize keeps
+  cubes within 0.66 m of the robot and Y from -0.15 to 0.42; restart the sim to pick this up.
+- **"target object ... not found in live scene" in pure-perception mode** — the camera did not see that cube (it can be hidden by the
+  arm or another cube). The guardrail re-observes up to 3 times; if it persists, `randomize` or switch the perception switch off.
+- **"there is no free spot on the table ..."** — the agent needed to move a blocking cube but the table is too crowded for a spot with
+  room for the hand; `reset` or `randomize` first.
 - **Perception mode rejects a step ("Z-target … out of bounds")** — the orchestrator re-observes up to 3 times
   before rejecting; a persistent failure means the camera can't see the object.
 
-More: `README.md` (overview), `ARCHITECTURE.md` and `TECHNICAL_DEEP_DIVE.md` (how it works), `PERCEPTION.md`
-(the camera-only pipeline), `cosmos_integration.md` (Cosmos design notes).
+More: `README.md` (overview), `HOW_IT_WORKS.md` (plain English), `ARCHITECTURE.md` and `TECHNICAL_DEEP_DIVE.md` (how it works),
+`PERCEPTION.md` (the camera-only pipeline), `cosmos_integration.md` (Cosmos).
