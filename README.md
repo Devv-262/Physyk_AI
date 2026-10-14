@@ -94,8 +94,7 @@ Latest end-to-end run on the real sim (default settings, 10 randomized layouts, 
 |---|---|
 | `workspace/` | Backend, orchestrator, sim service, perception, motion control |
 | `workspace/physyk_perception/` | Camera-only cube detection, Cosmos client, step verifier, overlay layout |
-| `assets/` | Franka Panda and scene object assets |
-| `scripts/` | Helper and diagnostic shell scripts |
+| `assets/franka_panda/` | Franka Panda URDF / mesh reference files (the sim loads the arm from Isaac Sim's own asset library) |
 | `workspace/scripts/arm_tests/` | End-to-end batch and arm-physics test tools (see its README) |
 | `CLAUDE.md` | Working notes for Claude Code sessions in this repo |
 | `run.sh`, `start_*_docker.sh` | Launchers |
@@ -111,6 +110,7 @@ Latest end-to-end run on the real sim (default settings, 10 randomized layouts, 
 | `PERCEPTION.md` | The camera-only pipeline: detector, calibration, measurements, limits |
 | `cosmos_integration.md` | How Cosmos is deployed and used |
 | `PROJECT_NARRATIVE.md` | The project write-up: objectives, capabilities, challenges and how they were fixed |
+| `HISTORY.md` | The setups the project has gone through (first cloud-VM setup, the lab environment, the glassware lab) and what was removed from this branch |
 | `INDUSTRY_APPLICATIONS.md` | Where this applies, and Q&A prep |
 
 ## Notes

@@ -196,9 +196,10 @@ about a minute.
 Physyk_AI/
 ├── README.md, HOW_IT_WORKS.md, ...   the documents (start here)
 ├── run.sh, start_*_docker.sh         start the app, the simulator and Cosmos
+├── HISTORY.md                        the earlier setups and what was removed
 ├── workspace/                        the application itself
 │   └── physyk_perception/            the camera-vision code
-├── assets/                           the robot's 3D model files
+├── assets/                           reference files for the robot arm
 └── logs/                             run logs
 ```
 

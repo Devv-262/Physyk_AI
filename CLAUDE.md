@@ -27,7 +27,7 @@ Environment switches (speed, obstacles, trace, seed, ...) are in the `README.md`
 | GUI + gateway | `workspace/physyk_main_server.py` |
 | Camera-only detection, Cosmos client, step verifier | `workspace/physyk_perception/` |
 | Test tools (end-to-end batch, arm physics harness) | `workspace/scripts/arm_tests/` (see its README) |
-| Docs | `README.md` (overview + env table), `HOW_IT_WORKS.md` (plain English), `ARCHITECTURE.md`, `TECHNICAL_DEEP_DIVE.md` (**§1.8 arm physics, §5 current challenges**), `PERCEPTION.md`, `cosmos_integration.md`, `instructions.md` (run guide), `PROJECT_NARRATIVE.md` |
+| Docs | `HISTORY.md` (earlier setups and what was removed), `README.md` (overview + env table), `HOW_IT_WORKS.md` (plain English), `ARCHITECTURE.md`, `TECHNICAL_DEEP_DIVE.md` (**§1.8 arm physics, §5 current challenges**), `PERCEPTION.md`, `cosmos_integration.md`, `instructions.md` (run guide), `PROJECT_NARRATIVE.md` |
 
 Read `README.md` and `TECHNICAL_DEEP_DIVE.md` §5 first in a new session. Keep the docs in sync when behaviour changes, and keep them
 plain, honest and limited to what the code does now (no VLA / GR00T / glassware material on this branch's docs).

@@ -50,7 +50,7 @@ Two details worth knowing:
 
 ### 1.2 Inverse kinematics — what is and isn't used
 
-- **`LulaKinematicsSolver`** is initialised with NVIDIA's bundled Franka config but not referenced afterwards; it is dead code.
+- NVIDIA's Lula kinematics solver was evaluated early on and is not used (it has been removed from the sim service).
 - **RMPFlow**, via `PickPlaceController._cspace_controller`, computes every joint target. `MotionPolicyController.forward`
   calls `update_world()` on every step, so the poses of the dynamic obstacles stay current.
 

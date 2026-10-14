@@ -29,11 +29,11 @@ the planner model is remote.
 ```mermaid
 flowchart LR
     subgraph Browser["Browser UI"]
-        UI["physyk_main_server.py HTML\n(GUI, WebSocket log/plan view,\nPerception / Cosmos / Nemotron log pages)"]
+        UI["physyk_main_server.py HTML\n(GUI polling /state every 150 ms,\nPerception / Cosmos / Nemotron log pages)"]
     end
 
     subgraph Bridge["Port 7860 (.venv python)"]
-        MAIN["physyk_main_server.py\nAPI/WS gateway + camera proxy"]
+        MAIN["physyk_main_server.py\nAPI gateway + camera proxy"]
     end
 
     subgraph Cognitive["NVIDIA hosted API"]
@@ -48,7 +48,7 @@ flowchart LR
         SIM["isaac_sim_service.py\nPhysX 60 Hz + RMPFlow + PickPlaceController\noverview + wrist cameras, perception provider\nsingle command_queue, one task at a time"]
     end
 
-    UI -- "instruction text / WS" --> MAIN
+    UI -- "instruction text (REST); /state polled" --> MAIN
     MAIN -- "decompose + dispatch\n(physyk_agent_orchestrator.py)" --> NEMO
     MAIN -- "/execute /state /reset /randomize\n/perception* (also camera MJPEG proxy)" --> SIM
     MAIN -- "pre/post-step image checks" --> COSMOS
@@ -60,7 +60,7 @@ flowchart LR
 
 | Role | File | Port |
 |---|---|---|
-| Gateway / GUI backend, camera proxy, WS broadcast, log pages | `physyk_main_server.py` | 7860 |
+| Gateway / GUI backend, camera proxy, log pages | `physyk_main_server.py` | 7860 |
 | Agentic orchestrator (Nemotron client, stack planner, guardrails, dispatch/verify loop) | `physyk_agent_orchestrator.py` | — (imported by the main server) |
 | Endpoints, keys, model names (env / `.env`) | `physyk_config.py` | — |
 | Isaac Sim physics + PickPlaceController + telemetry + cameras + perception wiring | `isaac_sim_service.py` | 8100 |
@@ -215,7 +215,7 @@ flowchart TD
     STEP -- "all subgoals processed" --> FINAL["Deterministic final-goal check (code only):\nre-compare each DONE step's final_pos\nagainst its CURRENT position"]
     FINAL --> VERDICT{"overall verdict"}
     VERDICT --> OUT(["SUCCESS / GOAL_NOT_HELD / PARTIAL / FAILED\n+ a plain-language answer"])
-    OUT --> EMIT["on_plan_update(plan) after every transition\n-> WS broadcast -> live GUI plan view"]
+    OUT --> EMIT["on_plan_update(plan) after every transition\n-> sim_state.plan -> the GUI sees it on its next /state poll"]
 ```
 
 ### Stack planning (`_stack_plan`)
@@ -265,7 +265,7 @@ sequenceDiagram
     participant NEMO as Nemotron (NVIDIA hosted API)
     participant SIM as isaac_sim_service.py :8100
 
-    UI->>MAIN: POST instruction (WS or REST)
+    UI->>MAIN: POST instruction (REST)
     MAIN->>MAIN: control command? no -> orchestrator path
     MAIN->>ORCH: run(instruction) [background thread]
     ORCH->>SIM: GET /state (live scene)
@@ -290,7 +290,7 @@ sequenceDiagram
     ORCH->>SIM: GET /state (final scene)
     ORCH->>ORCH: deterministic final-goal re-check
     ORCH->>MAIN: on_plan_update(plan) each transition
-    MAIN->>UI: WS broadcast sim_state.plan
+    UI->>MAIN: GET /state (polled every 150 ms) -> sim_state.plan
 ```
 
 ---

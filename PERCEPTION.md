@@ -133,8 +133,9 @@ before the fix and now guards against regressions.
 
 - Tuned to the default **studio** lighting; the neon/warm presets shift hues. Use studio for perception.
 - The HSV thresholds in `COLOR_SPECS` were rebuilt on 2026-10-13 from the measured pixel values recorded in the file's comments
-  (the originals were lost when the scene briefly held glassware) and verified on one saved cube frame. Re-measure them on the
-  lab background if detection looks off.
+  (the originals were lost when the scene briefly held glassware). Verified on one saved cube frame and by the offline synthetic test
+  below (2026-10-14: loose cubes 4.3-4.7 mm mean, stacked 4.1-9.4 mm, tray 5.4 mm, no misses). Re-measure them on the lab background
+  if detection looks off.
 - Colored cubes only, on the known table; not a general object detector. (Grounding DINO / SAM2 / a grasp
   network would be the upgrade path for arbitrary objects; not built.)
 - Lower cubes in a stack are less accurate (~8-9 mm in synthetic tests) because their top faces are hidden.
