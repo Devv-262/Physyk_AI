@@ -1,6 +1,6 @@
 # Physyk AI — notes for Claude
 
-A Franka Panda in NVIDIA Isaac Sim 6.0.1 (Docker) that takes plain-English instructions ("stack the cubes in the tray") and does the pick-and-place. "Stack ..." is planned by a **local deterministic planner** (`workspace/stack_planner.py`); other prompts are planned by Nemotron (hosted API, `nvidia/nemotron-3.5-lightning-30b-a3b`). The arm executes with NVIDIA's `PickPlaceController` + RMPFlow, the result is verified against real positions (or a fresh camera look in camera-only mode), and Cosmos (local NIM) gives a second visual opinion in a background thread.
+A Franka Panda in NVIDIA Isaac Sim 6.0.1 (Docker) that takes plain-English instructions ("stack the cubes in the tray") and does the pick-and-place. "Stack ..." is planned by a **local deterministic planner** (`workspace/stack_planner.py`); other prompts are planned by Nemotron one move at a time (`workspace/nemotron_planner.py`, thinking off, streamed; hosted API, `nvidia/nemotron-3.5-lightning-30b-a3b`). The arm executes with NVIDIA's `PickPlaceController` + RMPFlow, the result is verified against real positions (or a fresh camera look in camera-only mode), and Cosmos (local NIM) gives a second visual opinion in a background thread.
 
 **Current scene:** three cubes (red / green / blue) and a yellow tray on a work table, inside a visual-only factory backdrop (`factory_background.py`). No shelf. The glassware (flask / beaker + shelf) variant is **not** here: it lives on the GitHub branches `main` and `feature-lab`. Do not mix them.
 
@@ -27,18 +27,20 @@ Backend Python is `.venv/bin/python`. Secrets are in `.env` (git-ignored, never 
 | Camera-only detection, Cosmos client, step verifier | `workspace/physyk_perception/` |
 | Factory backdrop (visual only) | `workspace/factory_background.py` |
 | Nemotron / Cosmos log pages | `workspace/reasoning_dashboard.py` |
-| Offline tests | `workspace/scripts/test_stack_planner.py`, `test_stack_agent.py` |
+| Offline tests | `workspace/scripts/test_stack_planner.py`, `test_stack_agent.py`; `test_stepwise_agent.py` calls the real Nemotron API against the fake sim |
 | Docs | `README.md` (overview + env table), `HOW_IT_WORKS.md` (plain English), `ARCHITECTURE.md`, `TECHNICAL_DEEP_DIVE.md` (**§5 open problems**), `PERCEPTION.md`, `cosmos_integration.md`, `instructions.md` (run guide), `PROJECT_NARRATIVE.md`, `INDUSTRY_APPLICATIONS.md`, `HISTORY.md` |
 
 Read `README.md` and `TECHNICAL_DEEP_DIVE.md` §5 first in a new session. Keep the docs in sync when behaviour changes, and keep them plain, honest and limited to what the code does now (no VLA / GR00T / glassware material).
 
 ## State
 
-Working: tray / table / relative placements; "stack the cubes" planned locally from positions for any starting arrangement (existing piles taken apart from the top, partial piles extended, covered cubes never picked, unreachable cubes refused, nearby cubes ordered to keep the gripper clear) and re-planned from the live scene after every step; blocker clearing for named-cube prompts; the shared safe zone for Randomize and free spots; camera-only perception with a brightness-adaptive table calibration; guardrail retry on camera scenes; refusals quoted verbatim; Cosmos checks in background threads; two cameras, idle loop about 60 iterations/s; the NTT DATA themed GUI. Offline tests pass (12,000 planner layout-surface combinations, 47 agent-loop cases against a fake sim).
+Working: tray / table / relative placements; "stack the cubes" planned locally from positions for any starting arrangement and re-planned from the live scene after every step; **other prompts planned by Nemotron one move at a time** (goals split once, then one move per turn against the live scene, code decides when a goal is reached, thinking off, streamed; a cube that is not visible or a robot refusal ends the run, nothing is substituted); blocker clearing and parking; camera-only perception that keeps the cubes of a stack (shadowed lower cubes) and a cube carried by the arm; clean overlay (tight rectangles, labels beside them); guardrail retry on camera scenes; Cosmos checks in background threads; the NTT DATA themed GUI with green / red service and result colours, an About dialog and a smaller stage pill. Offline tests pass (12,000 planner combinations, 47 agent-loop cases, 4 stepwise cases against the fake sim with the real Nemotron API).
 
-**Not verified:** the planner as a batch on the real sim; pick wall time on this controller; touching cubes; the colour thresholds beyond the default layout in the dark room.
+Verified on the real sim (2026-10-15, one default layout each): 10 end-to-end prompts (single moves, "right of", stack in the tray / on the table, a 3-goal and a 4-goal chained prompt needing parking moves, a missing cube refused, deterministic and camera-only), all passed; the 4-goal prompt twice more.
 
-Open problems (details in `TECHNICAL_DEEP_DIVE.md` §5): the controller is an open-loop timer with no hand yaw, so a long sideways carry may overshoot (measured at about 21 cm on the dropped rebuild's controller, **not yet measured on this one**), the elbow posture is not controlled, RMPFlow obstacles are probably cleared by the controller's reset, Nemotron needs 20-50 s per plan (thinking mode), and the sim start-up occasionally hangs.
+**Not verified:** pick wall time on this controller as a batch; touching cubes; random layouts in bulk; the colour thresholds beyond the default layout in the dark room; the failure-diagnosis call with thinking off (one try, malformed answer treated as a retry); prefix caching on the hosted API (reported 0 cached tokens).
+
+Open problems (details in `TECHNICAL_DEEP_DIVE.md` §5): the controller is an open-loop timer with no hand yaw, so a long sideways carry may overshoot (measured at about 21 cm on the dropped rebuild's controller, **not yet measured on this one**), the elbow posture is not controlled, RMPFlow obstacles are probably cleared by the controller's reset, the sim start-up occasionally hangs, the sim loop runs at 28-55 iterations/s (below 60, so it runs slower than real time; rendering every step is the main cost).
 
 ## Rules for working here
 
@@ -52,6 +54,7 @@ Open problems (details in `TECHNICAL_DEEP_DIVE.md` §5): the controller is an op
 
 ## Gotchas learned the hard way
 
+- **The GUI's Hard Reset button is the only thing that stops a plan from outside.** If a test run shows "Plan stopped by hard reset", someone clicked it (the user's browser has the page open); it is not a code path.
 - **Seeing the GUI:** `google-chrome --headless=new --no-sandbox --disable-gpu --virtual-time-budget=7000 --window-size=1700,1250 --screenshot=out.png http://localhost:7860` gives a screenshot of the live page (add `--enable-logging=stderr --v=0` to catch JavaScript errors). A scene frame is `curl localhost:8100/camera/scene_raw.jpg`; a frame fetched right after a hot rebuild can be stale for a few seconds.
 - **The overview camera looks steeply down**, so it sees only the bottom ~1.4 m of the far walls; wall scenery is built at half scale (`SCENERY_SCALE`). Do not move the camera: the detector's calibration depends on it.
 - **A closed ceiling darkens the table.** The detector's table fit (`fit_table_plane`) uses a brightness floor relative to the table's own median; if camera-only heights drift, check `table_calibration.n` in `/perception` (tens of thousands = healthy, about a thousand = failing).

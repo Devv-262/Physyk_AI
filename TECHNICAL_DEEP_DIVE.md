@@ -65,6 +65,28 @@ Result: the idle loop runs at about **60 iterations/s** (it was 6-7 with five ca
 
 ---
 
+## 2.0 Nemotron settings (measured on the hosted 30B, 2026-10-15)
+
+Single calls on the hosted `nvidia/nemotron-3.5-lightning-30b-a3b`:
+
+| Setting | Result |
+|---|---|
+| default (thinking on), trivial JSON question | 3.3 s, 207 reasoning tokens for a 10-token answer |
+| `chat_template_kwargs.enable_thinking=false` | 0.5 s, 10 tokens |
+| `reasoning_budget` 256, `low_effort` | no visible effect (the model still thought for about 200 tokens) |
+
+Hard prompt "pick red over blue, blue on tray, green on blue and then blue on table" on a symbolic fake world (the stepwise planner of ARCHITECTURE.md §3.1b):
+
+| Mode | Result |
+|---|---|
+| thinking off, milestones tracked by code | 7 calls, about 1 s each, 9 s total, 338 completion tokens, goal reached; 3 of 3 prompts passed, and 4 of 4 against the fake sim through the real agent loop (9 of 9 runs over three repeats) |
+| thinking off, model tracks its own progress | 14 calls, looped (restarted the goal after each parking move), failed |
+| thinking on, 2,500-token cap | 26 s, no answer at all (the cap was spent thinking) |
+
+Chosen: thinking off, temperature 0, `max_tokens` 400 for a step (answers are 30-60 tokens), streaming on, thinking ceiling not used. Not measured: the hosted API reported `cached_tokens` 0 on these roughly 750-950-token prompts, so prefix caching was not observed. Occasional HTTP 429 under bursts (retried with Retry-After / 2-4-8-16 s back-off). The failure-decision call with thinking off returned one malformed answer in one try (treated as a plain retry); its quality is not established. Nothing here was run on the real arm: the GPU driver was down.
+
+---
+
 ## 2. Nemotron — agentic orchestration
 
 **Serving.** NVIDIA's hosted API (`https://integrate.api.nvidia.com/v1`), model `nvidia/nemotron-3.5-lightning-30b-a3b` from `physyk_config.py` / `.env`. A local OpenAI-compatible server works by setting `NEMOTRON_BASE_URL`. The hosted model returns its chain-of-thought in a separate `reasoning_content` field; `_message_text()` folds it back into the `reasoning</think>answer` shape the parsers expect. Calls retry on 429 and 5xx. `max_tokens` is 4096 for decomposition, 3072 for a failure decision and 2048 for the final answer, at temperature 0.

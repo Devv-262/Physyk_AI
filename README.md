@@ -19,7 +19,7 @@ Instruction ─► planner ─► guardrails ─► Isaac Sim (Franka Panda, RMP
 | Component | Role |
 |---|---|
 | **Isaac Sim 6.0.1** (Docker) | Physics (60 Hz) and two cameras (overview, wrist) |
-| **Nemotron 3.5 Lightning 30B-A3B** (NVIDIA hosted API) | Turns free-form instructions into pick/place steps; diagnoses failures |
+| **Nemotron 3.5 Lightning 30B-A3B** (NVIDIA hosted API) | Turns free-form instructions into pick/place moves, one at a time (thinking off, streamed); diagnoses failures |
 | **Local stack planner** (`stack_planner.py`) | Plans "stack the cubes" from positions alone: which cube is the base, which moves next, where blockers go |
 | **Camera-only perception** (GUI switch) | Colour masks + depth find the cubes by looking, about 20 ms; the arm then uses camera poses only |
 | **Cosmos 3 Nano Reasoner** (local NIM) | Independent visual check of each step (evidence only; never gates the arm) |
@@ -87,6 +87,9 @@ The sim service always runs headless in its container; the GUI at `localhost:786
 | `NEMOTRON_BASE_URL` | `https://integrate.api.nvidia.com/v1` | A local OpenAI-compatible server also works |
 | `COSMOS_BASE_URL` / `COSMOS_MODEL` | `http://localhost:8001/v1` / `nvidia/cosmos3-nano-reasoner` | The local Cosmos NIM |
 | `PHYSYK_STACK_PLANNER` | `code` | `code` = local stack planner; `llm` = let Nemotron plan stacking (slow, unreliable with a thinking model) |
+| `PHYSYK_PLANNER` | `stepwise` | `stepwise` = Nemotron splits a request into goals once, then proposes one move at a time against the live scene; `upfront` = the old single decomposition |
+| `NEMOTRON_STEP_THINKING` / `NEMOTRON_THINKING` | `off` | Thinking mode for the step planner / for the one-shot calls (decompose, failure decision). `on` restores the chain-of-thought (slow, can fill the token cap) |
+| `NEMOTRON_STEP_MAX_TOKENS` / `NEMOTRON_STEP_TEMPERATURE` | `400` / `0` | Completion cap and temperature of the step planner (an answer is 30-60 tokens) |
 | `PHYSYK_AGENTIC` | `1` | `0` sends every instruction straight to the sim (`./run.sh --no-agent`) |
 | `PHYSYK_ENCODE_EVERY` | `2` | JPEG-encode the camera streams every Nth loop iteration (frees time for physics) |
 | `PHYSYK_BACKGROUND` | `factory` | `grid` = original blue-grid ground |
@@ -102,13 +105,14 @@ python3 workspace/scripts/test_stack_planner.py [layouts]   # planner scenarios 
 .venv/bin/python workspace/scripts/test_stack_agent.py      # the agent loop against a fake simulator
 ```
 
-The planner suite runs 48 named scenarios and thousands of random layouts on every surface (tray, table, anywhere), with noisy positions, 2-4 cubes, covered and out-of-reach cubes, and checks that every plan ends as one pile with the minimum number of moves. It also checks that Randomize and free spots always stay inside the safe zone. The agent test runs the real `NeMoRoboticsAgent.run()` loop against a fake sim that can drop cubes at random. Last results: all passed (see `TECHNICAL_DEEP_DIVE.md` §3.6).
+The planner suite runs 48 named scenarios and thousands of random layouts on every surface (tray, table, anywhere), with noisy positions, 2-4 cubes, covered and out-of-reach cubes, and checks that every plan ends as one pile with the minimum number of moves. It also checks that Randomize and free spots always stay inside the safe zone. The agent test runs the real `NeMoRoboticsAgent.run()` loop against a fake sim that can drop cubes at random. Last results: all passed (see `TECHNICAL_DEEP_DIVE.md` §3.6). `workspace/scripts/test_stepwise_agent.py` (needs the API key) runs the step-at-a-time Nemotron planner through the real agent loop against the same fake simulator.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | `workspace/isaac_sim_service.py` | Sim loop, scene, controller phases, perception wiring, HTTP API on :8100 |
+| `workspace/nemotron_planner.py` | The step-at-a-time Nemotron planner: system prompt, scene-as-relations, milestones, streaming |
 | `workspace/physyk_agent_orchestrator.py` | Planner (Nemotron + stack planner), guardrails, dispatch / verify / retry |
 | `workspace/stack_planner.py` | The local stacking planner and the shared safe-zone rules |
 | `workspace/physyk_main_server.py` | GUI and gateway on :7860 |

@@ -66,7 +66,7 @@ class FakeSim:
                 tgt = NAME2KEY[t.split("pick up the ")[1].split(" cube")[0]]
                 c = self.world[tgt]
                 dest = t.split(" place it ")[1] if " place it " in t else ""
-                if "free spot" in dest:
+                if "free spot" in dest or dest.strip() == "on the table":
                     step = sp.Step(tgt, c.name, "free")
                 elif "tray" in dest:
                     step = sp.Step(tgt, c.name, "tray")

@@ -59,6 +59,11 @@ Decision: the 22 August code is a better base to develop from than the rebuilt c
 - **A restyled GUI:** the NTT DATA logo and theme (dark neutral base, muted steel-blue accents, no emoji), a compact grouped header, the stack line read from the configured models, tidied copy.
 - **Documentation:** all docs rewritten for this line.
 
+**Added after the restart (2026-10-15):**
+- Nemotron planning changed to one move at a time (`nemotron_planner.py`): measured on the hosted 30B, thinking off answers in about 1 s and thinking on took 25-60 s and sometimes never answered; the model alone tracking progress looped, so code tracks the goals.
+- Perception: the dim room put a stacked cube's sides below the brightness floor and a blue object off the table out-sized the cube, so the lower cube of a stack was dropped; fixed on real frames (blobs with a low floor, the first blob that is a real cube on the table wins) and the height limit raised so a carried cube is tracked.
+- GUI: label layout beside each box, status colours, About dialog, smaller stage pill.
+
 **Not brought over (still in the old history if wanted):** the hand-yaw alignment, the arrival and lift-clearance checks, release on contact, the obstacle modes and reach-minimum randomize, the joint trace and anomaly log, and the arm test tools. See `git show ef67e16:<path>`; the arm physics findings are summarised in `TECHNICAL_DEEP_DIVE.md` §5.
 
 ## Where to find earlier work

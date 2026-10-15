@@ -35,8 +35,12 @@ HALF_HEIGHT_M = {"red_cube": 0.025, "green_cube": 0.025, "blue_cube": 0.025, "ta
 
 # World-space box the cubes can ever be in (table top, with room for a 3-cube stack). Its
 # projection into the image is the only place we look — keeps the blue ground grid out.
-TABLE_ROI_BOX = ((0.0, 0.9), (-0.65, 0.65), (-0.02, 0.22))
+TABLE_ROI_BOX = ((0.0, 0.9), (-0.65, 0.65), (-0.02, 0.42))   # up to 0.42 m so a cube carried by the arm is still looked for
 
+# Brightness floor for the colour blobs: a cube low in a stack sits in shadow and the factory room is dim, so a cube's sides can fall
+# below the specs' "v_min" (blue needs 190; measured blue sides are V 150-180). Blobs use this floor; a blob only counts if it is a real
+# cube on the table (see color_blobs / _locate_in_mask).
+V_SHADOW = 70
 TOP_GROW_PX = 25              # how far (px) the top face can extend from the side faces (~1 cube)
 MIN_MASK_PIXELS = 25          # a cube is ~20x20 px in the 960x540 overview frame
 TOP_FACE_BAND_M = 0.002       # points within this of the top surface count as the top face
@@ -67,14 +71,16 @@ def roi_mask(shape, intrinsics, world_transform, box=TABLE_ROI_BOX) -> np.ndarra
     return roi
 
 
-def color_mask(rgb: np.ndarray, obj_key: str, roi: np.ndarray = None) -> np.ndarray:
-    """Boolean HxW mask of pixels matching obj_key's color (inside `roi` if given), largest
-    connected blob only (drops speckle and any stray same-colored pixels elsewhere)."""
+def color_blobs(rgb: np.ndarray, obj_key: str, roi: np.ndarray = None, max_blobs: int = 4):
+    """Boolean HxW masks of the pixel blobs matching obj_key's colour (inside `roi` if given), biggest first. A cube low in a stack
+    sits in shadow, so the brightness floor is low (V_SHADOW) and a bright same-hue thing elsewhere (a blue bin on the rack, a
+    signal light) can out-size the cube: the caller therefore tries the blobs in turn and keeps the first that is really a cube
+    on the table (see locate_cube), instead of trusting the largest one."""
     spec = COLOR_SPECS[obj_key]
     hsv = cv2.cvtColor(np.ascontiguousarray(rgb[:, :, :3]), cv2.COLOR_RGB2HSV)
     mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
     for lo, hi in spec["hue"]:
-        mask |= cv2.inRange(hsv, (lo, spec["s_min"], spec["v_min"]), (hi, 255, 255))
+        mask |= cv2.inRange(hsv, (lo, spec["s_min"], V_SHADOW), (hi, 255, 255))
     if "s_weak" in spec and mask.any():
         # Grow into the top face: same hue, brighter but paler than the sides, and near the strong mask.
         weak = np.zeros_like(mask)
@@ -86,10 +92,14 @@ def color_mask(rgb: np.ndarray, obj_key: str, roi: np.ndarray = None) -> np.ndar
         mask = cv2.bitwise_and(mask, roi)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if n <= 1:
-        return np.zeros(mask.shape, dtype=bool)
-    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    return labels == biggest
+    order = [i for i in np.argsort(-stats[1:, cv2.CC_STAT_AREA]) + 1 if stats[i, cv2.CC_STAT_AREA] >= MIN_MASK_PIXELS]
+    return [labels == i for i in order[:max_blobs]]
+
+
+def color_mask(rgb: np.ndarray, obj_key: str, roi: np.ndarray = None) -> np.ndarray:
+    """The biggest colour blob (see color_blobs), or an empty mask."""
+    blobs = color_blobs(rgb, obj_key, roi, 1)
+    return blobs[0] if blobs else np.zeros(rgb.shape[:2], dtype=bool)
 
 
 def _deproject_pixels(us, vs, zs, intrinsics, world_transform):
@@ -107,7 +117,15 @@ def locate_cube(rgb, depth, obj_key, intrinsics, world_transform, cube_half_heig
     COLOR_SPECS / HALF_HEIGHT_M); cube_half_height overrides the per-object default."""
     half_h = HALF_HEIGHT_M.get(obj_key, 0.025) if cube_half_height is None else cube_half_height
     is_slab = bool(COLOR_SPECS[obj_key].get("slab"))
-    mask = color_mask(rgb, obj_key, roi)
+    for mask in color_blobs(rgb, obj_key, roi):
+        found = _locate_in_mask(mask, depth, obj_key, intrinsics, world_transform, half_h, is_slab)
+        if found is not None:
+            return found
+    return None
+
+
+def _locate_in_mask(mask, depth, obj_key, intrinsics, world_transform, half_h, is_slab):
+    """Pose of the object in one colour blob, or None if the blob is not a plausible object on the table."""
     if int(mask.sum()) < MIN_MASK_PIXELS:
         return None
     vs_all, us_all = np.nonzero(mask)                      # full silhouette (for the overlay box)
@@ -145,6 +163,10 @@ def locate_cube(rgb, depth, obj_key, intrinsics, world_transform, cube_half_heig
         if len(footprint) < 6:
             return None
         (cx, cy), yaw_deg = _fit_square(footprint, 2.0 * half_h - CUBE_EDGE_SHRINK_M)
+
+    (bx0, bx1), (by0, by1), (bz0, bz1) = TABLE_ROI_BOX
+    if not (bx0 <= cx <= bx1 and by0 <= cy <= by1 and bz0 <= top_surface_z - half_h <= bz1):
+        return None                      # a same-coloured thing off the table (rack, bin, light), not the cube
 
     return {
         "position": [float(cx), float(cy), top_surface_z - half_h],

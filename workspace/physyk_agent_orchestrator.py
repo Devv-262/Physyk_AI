@@ -48,6 +48,7 @@ logging.basicConfig(level=logging.INFO, format="[NeMo-Agent] %(message)s")
 log = logging.getLogger("physyk.orchestrator")
 
 import physyk_config as cfg
+import nemotron_planner as npl
 
 ISAAC_SIM_URL = cfg.ISAAC_SIM_URL
 
@@ -66,6 +67,14 @@ MAX_SUBGOAL_ATTEMPTS = 3     # 1 plain retry, then 1 Nemotron-replanned correcti
 # re-planned from the live scene after every step); "llm" = Nemotron decides (slow and unreliable with a thinking model).
 # The code planner is also the fallback when Nemotron is unreachable.
 STACK_PLANNER = os.environ.get("PHYSYK_STACK_PLANNER", "code").lower()
+# Who plans everything else: "stepwise" (default) = Nemotron splits the request into milestones once, then proposes ONE move at a
+# time against the live scene (nemotron_planner.py: thinking off, streamed, about 1 s per move); "upfront" = the old single
+# decomposition of the whole request (slow with a thinking model, and it has to plan the parking moves blind).
+PLANNER_MODE = os.environ.get("PHYSYK_PLANNER", "stepwise").lower()
+# The one-shot calls below (whole-request decomposition, failure diagnosis) also run with thinking off: measured on the hosted 30B,
+# thinking took 25-60 s and sometimes filled the whole token cap without ever emitting the JSON. NEMOTRON_THINKING=on restores it.
+THINKING_OFF = os.environ.get("NEMOTRON_THINKING", "off").lower() != "on"
+MAX_CONSECUTIVE_STEP_FAILURES = 3
 MAX_STACK_PLAN_CHANGES = 12      # hard cap on plan rewrites per run (a loop guard)
 MAX_STACK_REPLANS = 6              # re-plans after a step that failed (not counting the normal re-plan after each step)
 GUARDRAIL_RETRIES = 3        # re-observations before a guardrail failure on a camera-derived scene stands
@@ -660,7 +669,8 @@ def _call_nemotron(instruction: str, scene: Dict[str, Any]) -> str:
         # this silently degraded every complex prompt to single-step "direct" dispatch, the
         # exact regression reported live. The server's own --max-model-len was raised to
         # 12288 alongside this so the extra completion budget actually fits.
-        "max_tokens": 4096,
+        "max_tokens": 4096 if not THINKING_OFF else 800,
+        **({"chat_template_kwargs": {"enable_thinking": False}} if THINKING_OFF else {}),
     }
     status, body = _nemotron_chat(payload)
     if status != 200 or not body:
@@ -862,7 +872,8 @@ def request_failure_decision(
         # _call_nemotron) — a replan_remaining decision has to reason about the whole rest of
         # the plan plus emit a full subgoals array, which is more completion-hungry than a
         # plain retry/replan_step decision.
-        "max_tokens": 3072,
+        "max_tokens": 3072 if not THINKING_OFF else 700,
+        **({"chat_template_kwargs": {"enable_thinking": False}} if THINKING_OFF else {}),
     }
     status, body = _nemotron_chat(payload)
     if status != 200 or not body:
@@ -998,7 +1009,8 @@ def request_final_answer(instruction: str, summary: Dict[str, Any]) -> Optional[
             {"role": "user", "content": "Write the final answer."},
         ],
         "temperature": 0.0,
-        "max_tokens": 2048,
+        "max_tokens": 600,                                       # a 2-6 sentence answer; thinking is off (it only added seconds)
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     status, body = _nemotron_chat(payload)
     if status != 200 or not body:
@@ -1062,7 +1074,11 @@ class NeMoRoboticsAgent:
         # instead of running to its own natural conclusion (retries, replans, and all).
         # threading.Event is safe to set from a different thread than the one running run().
         self._stop_event = threading.Event()
-        log.info("Real Nemotron-backed NeMo agentic orchestrator online.")
+        # One planner conversation for the agent's lifetime (see nemotron_planner.py); its system prompt is primed once now.
+        self.step_planner = npl.StepPlanner()
+        if PLANNER_MODE == "stepwise":
+            threading.Thread(target=lambda: log.info(f"[Nemotron] system prompt primed ({npl.warm_up()} s)"), daemon=True).start()
+        log.info(f"Real Nemotron-backed NeMo agentic orchestrator online (planner: {PLANNER_MODE}).")
 
     def request_stop(self):
         self._stop_event.set()
@@ -1315,18 +1331,58 @@ class NeMoRoboticsAgent:
         _emit()
 
         scene = fetch_live_scene()
-        subgoals, planning_reasoning = self.decompose_task_with_reasoning(instruction, scene)
+        stepwise = PLANNER_MODE == "stepwise" and not (STACK_PLANNER == "code" and _expand_stack_instruction(instruction, scene) is not None)
+        sw = {"fed": 0, "cur": 0, "stop": None, "repeats": 0}
+        subgoals, planning_reasoning = [], ""
+        if stepwise:
+            _stream = {"t": 0.0}
+
+            def _on_stream(kind: str, text: str) -> None:
+                plan["planner_stream"] = (plan.get("planner_stream", "") + text)[-400:]
+                if time.time() - _stream["t"] > 0.25:
+                    _stream["t"] = time.time()
+                    _emit()
+
+            self.step_planner.on_stream = _on_stream
+            self.step_planner.start_goal(instruction)
+            try:
+                outline = self.step_planner.plan_goals(scene)
+            except Exception as e:
+                _log(f"[Nemotron] step planner unavailable ({e}) - planning the whole request at once instead.", "WARN")
+                outline, stepwise = None, False
+            plan.pop("planner_stream", None)
+            if outline is not None:
+                _visible = {k for k in (scene.get("objects") or {}) if k.endswith("_cube")}
+                _unknown = [m for m in (outline.get("milestones") or [])
+                            if npl._cube_key(m["target"]) not in _visible
+                            or (npl._cube_key(m["destination"]) is not None and npl._cube_key(m["destination"]) not in _visible)]
+                if _unknown:                       # a cube the user named that is not on the table: refuse, never substitute
+                    _bad = _unknown[0]
+                    outline = {"impossible": f"the {_bad['target']} is not something I can see right now"}
+                if "milestones" in outline and outline["milestones"]:
+                    ms = outline["milestones"]
+                    planning_reasoning = "Goal split into: " + "; ".join(
+                        f"{k + 1}. {m['target']} -> {m['destination'] or '(pick up)'}" for k, m in enumerate(ms))
+                    plan["milestones"] = ms
+                    NEMOTRON_REASONING_LOG.add(f"Outline: {instruction[:80]}", outline.get("say", "") + "\n" + planning_reasoning)
+                else:
+                    why = outline.get("impossible") or "no steps"
+                    subgoals, planning_reasoning = [], f"(cannot do this: {why})"
+        if not stepwise:
+            subgoals, planning_reasoning = self.decompose_task_with_reasoning(instruction, scene)
         # Nemotron's own chain-of-thought for *why* it split the instruction this way — shown
         # in the UI above the step list so "the planner is thinking" is visible, not just its
         # final answer. Truncated defensively; a reasoning model's CoT can run long.
         plan["planning_reasoning"] = planning_reasoning[:2000] if planning_reasoning else None
         NEMOTRON_REASONING_LOG.add(f"Decompose: {instruction[:80]}", planning_reasoning)
-        if not subgoals:
+        if not subgoals and not (stepwise and plan.get("milestones")):
             seen = ", ".join(str(o.get("name", "?")).lower() for o in (scene.get("objects") or {}).values())
             if planning_reasoning and planning_reasoning.startswith("(the cubes are already"):
                 msg = "The cubes are already stacked in one pile, so there is nothing to do."
             elif planning_reasoning and planning_reasoning.startswith("(cannot stack"):
                 msg = planning_reasoning.strip("()").replace("cannot stack: ", "I cannot stack the cubes: ", 1)
+            elif planning_reasoning and planning_reasoning.startswith("(cannot do this: "):
+                msg = "I cannot do that: " + planning_reasoning[len("(cannot do this: "):-1] + "."
             elif planning_reasoning and planning_reasoning.startswith("(fewer than two cubes"):
                 msg = "I can see fewer than two cubes right now, so there is nothing to stack."
             else:
@@ -1343,7 +1399,8 @@ class NeMoRoboticsAgent:
             for i, sg in enumerate(subgoals, start=1)
         ]
         plan["overall"] = "RUNNING"
-        _log(f"Plan: {len(subgoals)} subgoal(s) for '{instruction}'")
+        _log(f"Plan: {len(plan.get('milestones') or [])} milestone(s), moves are planned one at a time" if stepwise
+             else f"Plan: {len(subgoals)} subgoal(s) for '{instruction}'")
         if planning_reasoning:
             _log(f"[Nemotron reasoning] {planning_reasoning[:300]}", "INFO")
         _emit()
@@ -1386,8 +1443,82 @@ class NeMoRoboticsAgent:
             ]
             _emit()
 
+        def _plan_next() -> bool:
+            """Stepwise mode: show the model what the moves since its last answer did, then get ONE next move for the current
+            milestone and append it as a step. False = the goal is reached, or the planner stopped (reason in sw["stop"])."""
+            nonlocal scene
+            live = fetch_live_scene()
+            fed = plan["steps"][sw["fed"]:]
+            last_move, last_ok = None, False
+            for st in fed:
+                sg = st["subgoal"]
+                outcome = {"DONE": "verified OK"}.get(st["status"], f"FAILED: {st.get('detail') or st['status'].lower()}")
+                if st["status"] == "REJECTED":
+                    outcome = f"REJECTED by the safety check: {st.get('detail')}"
+                raw = st.get("raw_answer") or {"say": "(inserted by the agent)", "next": {
+                    "action": "pick_place", "target": sg.get("target"), "destination": sg.get("destination") or ""}}
+                self.step_planner.record_result(raw, outcome)
+                last_move, last_ok = sg, st["status"] == "DONE"
+            sw["fed"] = len(plan["steps"])
+            for st in fed:                          # a safety-check rejection or a robot refusal ends the run; nothing is substituted
+                if st["status"] == "REJECTED" or st.get("refused"):
+                    sw["stop"] = st.get("detail") or "a step was refused"
+                    return False
+            fails = 0
+            for st in reversed(plan["steps"]):
+                if st["status"] == "DONE":
+                    break
+                fails += 1
+            if fails >= MAX_CONSECUTIVE_STEP_FAILURES:
+                sw["stop"] = f"{fails} moves in a row did not work"
+                return False
+            sw["cur"] = npl.advance(self.step_planner.milestones, sw["cur"], live, last_move, last_ok)
+            if sw["cur"] >= len(self.step_planner.milestones):
+                return False
+            plan["planner_stream"] = ""
+            try:
+                ans = self.step_planner.next_move(live, sw["cur"])
+            except Exception as e:
+                sw["stop"] = f"the planner did not answer ({e})"
+                return False
+            finally:
+                plan.pop("planner_stream", None)
+            stats = ans.get("stats") or {}
+            _log(f"[Nemotron] {ans.get('say', '')}  ({stats.get('total_s', '?')} s, "
+                 f"{(stats.get('usage') or {}).get('completion_tokens', '?')} tokens)")
+            NEMOTRON_REASONING_LOG.add(f"Move {len(plan['steps']) + 1}", (ans.get("reasoning") or "") + "\n" + ans.get("say", ""))
+            if "impossible" in ans:
+                sw["stop"] = ans["impossible"]
+                return False
+            if "next" not in ans:                  # the model says the goal holds: code decides below (final milestone check)
+                sw["stop"] = None if npl.advance(self.step_planner.milestones, sw["cur"], live) >= len(self.step_planner.milestones) \
+                    else "the planner said it was done but the last placement does not hold in the scene"
+                return False
+            try:
+                sg = _validate_subgoal_shape(dict(ans["next"]))
+            except ValueError as e:
+                sw["stop"] = f"the planner proposed an invalid move ({e})"
+                return False
+            prev = subgoals[-1] if subgoals else None
+            if prev is not None and prev.get("target") == sg.get("target") and prev.get("destination") == sg.get("destination") and last_ok:
+                sw["repeats"] += 1
+                if sw["repeats"] >= 2:
+                    sw["stop"] = "the planner kept repeating the same move"
+                    return False
+            else:
+                sw["repeats"] = 0
+            subgoals.append(sg)
+            plan["steps"].append({"index": len(plan["steps"]) + 1, "text": _preview_text(sg), "subgoal": sg, "status": "PENDING",
+                                  "detail": None, "raw_answer": ans.get("raw"), "planner_reasoning": ans.get("say")})
+            scene = live
+            _emit()
+            return True
+
         idx = 0
-        while idx < len(subgoals):
+        while True:
+            if idx >= len(subgoals):
+                if not (stepwise and _plan_next()):
+                    break
             if self._stop_event.is_set():
                 aborted = True
                 break
@@ -1629,8 +1760,8 @@ class NeMoRoboticsAgent:
                 _emit()
                 if attempt >= MAX_SUBGOAL_ATTEMPTS:
                     break
-                if stack_req is not None:
-                    break          # stacking: no model call - the pile is planned again from the live positions below
+                if stack_req is not None or stepwise:
+                    break          # stacking: the pile is planned again from the live positions below; stepwise: the planner sees the failure
 
                 fresh_scene = fetch_live_scene()
                 step.update(status="REPLANNING", detail="Nemotron diagnosing the failure...")
@@ -1740,6 +1871,11 @@ class NeMoRoboticsAgent:
                 _replan_stack(idx + 1, scene, f"after the failed step {i}")
                 idx += 1
                 continue
+            if not step_done and stepwise:
+                _log(f"Step {i} did not work - the planner will choose again from the live scene.", "WARN")
+                scene = fetch_live_scene()
+                idx += 1
+                continue
             if not step_done:
                 _log(f"Aborting remaining plan after step {i}/{n} failed.", "ERROR")
                 for later in plan["steps"][idx + 1:]:
@@ -1775,7 +1911,12 @@ class NeMoRoboticsAgent:
         # the ORIGINAL goal actually still true, not just "every step individually passed".
         n_done = sum(1 for r in results if r["status"] == "DONE")
         goal_held = True
-        if n_done > 0:
+        goal_reached = None            # stepwise mode: did the last milestone hold in the final scene
+        if stepwise:
+            _fs = fetch_live_scene()
+            _ms = self.step_planner.milestones
+            goal_reached = sw["stop"] is None and npl.advance(_ms, sw["cur"], _fs) >= len(_ms)
+        if n_done > 0 and not stepwise:
             plan["overall"] = "VERIFYING"
             _emit()
             final_scene = fetch_live_scene()
@@ -1821,7 +1962,9 @@ class NeMoRoboticsAgent:
             stack_verdict = sp.is_stacked(fetch_live_scene(), stack_req["surface"])
             if not stack_verdict:
                 _log("Final goal check: the cubes are not in one pile on the requested surface.", "WARN")
-        if stack_verdict is not None:
+        if stepwise:
+            overall = "SUCCESS" if goal_reached else ("PARTIAL" if n_done > 0 else "FAILED")
+        elif stack_verdict is not None:
             overall = "SUCCESS" if stack_verdict else "PARTIAL"
         elif n_done == len(subgoals) and goal_held:
             overall = "SUCCESS"
@@ -1831,10 +1974,22 @@ class NeMoRoboticsAgent:
             overall = "PARTIAL"
         else:
             overall = "FAILED"
-        _log(f"Plan complete: {overall} ({n_done}/{len(subgoals)} subgoals done)",
+        _log(f"Plan complete: {overall} ({n_done}/{len(subgoals)} move(s) done)",
              "SUCCESS" if overall == "SUCCESS" else "WARN")
         summary = build_outcome_summary(results, refusal_log)
         answer = compose_final_answer(instruction, summary)
+        if stepwise and goal_reached and not summary["not_placed"] and not summary.get("worked_around"):
+            # Only what holds now: earlier placements that a later goal took apart on purpose, and the parking moves, are not
+            # listed one by one ("the blue cube is on the red cube; ... on a free spot") - that reads as a contradiction.
+            _loc, _ = npl.cube_locations(_fs)
+            _now = [f"the {m['target']} is {m['destination']}" for m in self.step_planner.milestones
+                    if npl.milestone_holds(m, _fs) is not False]    # None = a relative placement ("right of"): the verified move is the evidence
+            _parked = sum(1 for r in results if r["status"] == "DONE"
+                          and "free spot" in ((r["subgoal"].get("destination") or "").lower()))
+            answer = ("Done: " + ("; ".join(_now) if _now else "every step you asked for was carried out") + "."
+                      + (f" {_parked} cube move(s) were only to clear the way." if _parked else ""))
+        if stepwise and sw["stop"]:
+            answer = f"{answer} I stopped because {sw['stop']}."
         _log(f"[Answer] {answer}", "SUCCESS" if overall == "SUCCESS" else "WARN")
         plan.update(active=False, overall=overall, answer=answer, summary=summary)
         _emit()

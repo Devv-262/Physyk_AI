@@ -177,6 +177,17 @@ The same module defines the **safe zone** used wherever the system places a cube
 
 Prompts that name colours or sequence steps ("put red on blue, then ...") go to Nemotron. `PHYSYK_STACK_PLANNER=llm` also sends plain stacking requests there; the code planner stays as the fallback when Nemotron fails.
 
+### 3.1b Step-at-a-time planning (`nemotron_planner.py`)
+
+Prompts that name colours or sequence steps ("pick red over blue, blue on the tray, green on blue and then blue on the table") are not planned up front. Nemotron is called twice in two shapes, both with thinking off and streamed:
+
+1. **Outline (once):** the request becomes ordered *milestones*, the final placements the user asked for. A milestone naming a cube that is not on the table is refused up front (nothing is substituted).
+2. **Next move (every turn):** the model sees the milestones marked done / current / later, the last few moves with their verified results, and the live scene written as relations by code ("blue cube: in the tray, COVERED by the green cube"). It answers one move: the milestone's own placement, or the move that clears what is in the way (a covered cube, a covered base), usually parking a cube on a free spot.
+
+**Code, not the model, decides when a milestone is reached** (`advance` / `milestone_holds`, from positions or the verified move), so the model never has to remember progress. The first version let the model track it and it restarted the goal after every parking move (14 moves, no result). The arm starts moving after the first answer (about 1-2 s) instead of after a whole plan. A step the safety check rejects or the robot refuses ends the run with that reason; nothing is substituted. Three failed moves in a row also end it.
+
+The API is stateless: "keeping" the system prompt means sending the same static prefix each turn (no scene in it) and priming it once at start-up (`warm_up`). Older goals ride along as one-line summaries and only the latest scene is sent.
+
 ### 3.2 Why the loop looks the way it does
 
 Each choice closes a live-reproduced bug:

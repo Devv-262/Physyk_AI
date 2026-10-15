@@ -42,6 +42,7 @@ The GUI switch calls `POST /perception_mode` on the backend, which calls `POST /
 
 - **Camera:** the isometric overview at (1.85, -1.55, 1.30) m looking at (0.35, 0, 0.28); 960x540; focal length 22 mm (fx about 1008 px). A cube is about 20 px wide. Depth is the `distance_to_image_plane` annotator on the same render product. Intrinsics and extrinsics are computed analytically from the camera's creation parameters (`SCENE_CAM_INTRINSICS`, `SCENE_CAM_WORLD_TRANSFORM`) and must be kept in sync with the camera setup. The camera is the one thing the scene work must not move.
 - **Colour masks** (`physyk_perception/color_segment.py`): HSV thresholds measured from real frames, restricted to the table area of the image. Two tiers: strong colour for the cube's side faces, then a growth step into the cube's **top face**, which renders almost white under the studio lighting and would otherwise be missed.
+- **Colour blobs and the brightness floor:** blobs are built from hue and saturation with a low brightness floor (`V_SHADOW` 70), because a cube low in a stack sits in shadow and the dim factory room lowers the sides further (measured blue sides: V 150-180, below the spec's 190). A low floor lets same-hue things off the table (a blue bin on the rack, the signal light) form blobs that can out-size a cube, so `locate_cube` tries the blobs biggest first and keeps the first one whose fitted position lies in the table box. On a real frame of a green cube on a blue cube this found the blue cube 3-5 mm from the simulator's position; before, blue was reported missing and stacking failed.
 - **Position:** every mask pixel is deprojected with its depth. The 3D footprint (top face plus the two camera-facing sides) is fitted with a square of the known 5 cm size, which works even when the top face is hidden by a cube stacked on it (the two sides form an "L" that pins the square). Averaging top-face pixels instead is biased toward the camera.
 - **Height:** the measured top surface minus half a cube.
 - **Yaw:** the square fit also gives the cube's yaw (modulo 90 degrees). It is reported in `/perception` and the Perception Log. **This controller does not use it**: the hand is not turned to the cube's faces.
@@ -58,7 +59,7 @@ The orchestrator rejects a step whose target is outside the reachable workspace.
 
 ## Logs and screenshots
 
-- **Overview feed:** in pure mode it shows bounding boxes with camera-estimated XYZ (labels laid out in a column beside the cubes with leader lines) and a `PERCEPTION: CAMERA ONLY` banner. These are drawn by the sim into the frame, so they belong to the scene output. Off: unchanged.
+- **Overview feed:** in pure mode it shows bounding boxes with camera-estimated XYZ (a thin rectangle tight round each cube, the label right beside it - above, below, right or left, whichever is free - and a short leader line only when no free spot is left; the tray is outlined by its footprint; refreshed every 0.15 s while the arm moves, 0.3 s idle; a cube the arm hides keeps its last box for 0.7 s, marked "(hidden)") and a `PERCEPTION: CAMERA ONLY` banner. These are drawn by the sim into the frame, so they belong to the scene output. Off: unchanged.
 - **Perception Log** (`/reasoning/perception`, a link in the header): for every pre-pick detection, post-place verification and mode switch — the annotated frame, per-object camera XYZ, yaw, and the hidden scoring error.
 - **Cosmos Log** entries carry the exact image Cosmos was shown. Cosmos receives a clean frame (`/camera/scene_raw.jpg`, no overlay) so drawn labels cannot bias it.
 - Cosmos is evidence only; it never decides what the robot does.
@@ -76,11 +77,13 @@ These are one default layout each, not a batch. Earlier work on the first camera
 
 ## Known limits
 
+- While the arm moves, a cube it holds or covers can drop out for a moment (measured: the carried cube was missed in 15 of 106 samples at 0.25 s; the stacked cubes in 0 of 106). The overlay keeps its last box for 1.5 s marked "(hidden)"; decisions use only current sightings.
+
 - Tuned to the default **studio** lighting; the neon and warm presets shift hues. Use studio for perception. Anything that darkens the table further needs a re-check of the colour thresholds.
 - Coloured cubes only, on the known table; not a general object detector. (A grounding model plus segmentation would be the upgrade path for arbitrary objects; not built.)
 - Lower cubes in a stack are less accurate (about 8-9 mm in earlier synthetic tests) because their top faces are hidden.
 - The tray is fixed by assumption; moving it would need detection re-enabled.
-- Perception refreshes at dispatch, at verification, and every 0.5-1 s in pure mode; the arm can occlude a cube momentarily.
+- Perception refreshes at dispatch, at verification, and every 0.15-0.3 s in pure mode; the arm can occlude a cube momentarily.
 - Scenery in the factory backdrop is kept outside the table region the colour detector looks at; its few saturated accents (blue bins, the signal tower) are far from it.
 
 ## Files
@@ -90,7 +93,7 @@ These are one default layout each, not a batch. Earlier work on the first camera
 | `workspace/physyk_perception/color_segment.py` | colour masks, top-face growth, square fit, table-plane fit |
 | `workspace/physyk_perception/provider.py` | `PerceptionProvider`: modes, fixed poses, snapshot, calibration |
 | `workspace/physyk_perception/deproject.py` | pinhole deprojection and projection |
-| `workspace/physyk_perception/overlay_layout.py` | non-overlapping label placement for the overlay |
+| `workspace/physyk_perception/overlay_layout.py` | label placement for the overlay (beside each box, leader line only as a fallback) |
 | `workspace/isaac_sim_service.py` | wiring: decision poses, verification, overlay, log, `/perception*` endpoints |
 | `workspace/physyk_agent_orchestrator.py` | guardrail retry, Cosmos evidence with images |
 | `workspace/physyk_main_server.py` | GUI switch, `/perception_mode`, Perception Log page |

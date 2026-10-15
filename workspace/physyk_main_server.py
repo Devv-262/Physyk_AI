@@ -586,6 +586,9 @@ HTML = """<!DOCTYPE html>
     --green: #7fb4c9;
     --amber: #b3a98f;
     --red: #b88a93;
+    --ok: #86b39d;          /* dull green: running / done / success */
+    --bad: #c4807f;         /* dull red: offline / failed */
+    --coral: #e0705f;       /* hard reset */
     --text: #eef1f7;
     --muted: #7e879a;
     --muted-2: #59626f;
@@ -941,11 +944,59 @@ HTML = """<!DOCTYPE html>
   header .hlink { color: var(--muted); text-decoration: none; cursor: pointer; transition: color 0.15s, border-color 0.15s; }
   header .hlink:hover { color: var(--text); border-color: #333d50; }
   header .dot { width: 7px; height: 7px; flex-shrink: 0; }
+
+  /* ── Status colours: dull green = running / done, dull red = offline / failed, coral = hard reset ── */
+  .svc-pill.svc-online { color: var(--ok); border-color: rgba(134,179,157,0.38); background: rgba(134,179,157,0.09); }
+  .svc-pill.svc-online .svc-dot { background: var(--ok); }
+  .svc-pill.svc-offline { color: var(--bad); border-color: rgba(196,128,127,0.38); background: rgba(196,128,127,0.09); }
+  header .svc-pill.svc-offline .svc-dot, .svc-pill.svc-offline .svc-dot { background: var(--bad); }
+  header .status-pill .dot { background: var(--ok); }
+  header .status-pill .dot.busy { background: var(--amber); }
+  header .status-pill .dot.off { background: var(--bad); animation: none; }
+  .live-dot { background: var(--ok); } .live-tag { color: var(--ok); }
+  /* smaller stage pill at the bottom of the viewport */
+  .stage-overlay { bottom: 10px; padding: 3px 11px; font-size: 0.62rem; font-weight: 600; letter-spacing: 0.3px; gap: 6px; background: rgba(9,11,15,0.70); }
+  .stage-overlay .stage-dot { width: 5px; height: 5px; }
+  .stage-overlay.idle .stage-dot { background: var(--ok); }
+  .btn-danger { color: var(--coral); border: 1px solid rgba(224,112,95,0.55); background: rgba(224,112,95,0.06); }
+  .btn-danger:hover:not(:disabled) { background: rgba(224,112,95,0.16); border-color: var(--coral); }
+  .plan-step.DONE { border-color: rgba(134,179,157,0.45); }
+  .badge-DONE, .plan-status-SUCCESS { background: rgba(134,179,157,0.16); color: var(--ok); }
+  .plan-step.FAILED, .plan-step.REJECTED { border-color: rgba(196,128,127,0.5); }
+  .badge-FAILED, .badge-REJECTED, .plan-status-FAILED, .plan-status-REJECTED, .plan-status-GOAL_NOT_HELD { background: rgba(196,128,127,0.16); color: var(--bad); }
+  .plan-step.ABORTED { border-color: rgba(196,128,127,0.25); }
+
+  /* ── About button (top right) and its dialog ── */
+  header { position: relative; }
+  .about-btn { position: absolute; top: 18px; right: 26px; height: 28px; padding: 0 14px; border-radius: 999px; background: transparent;
+    border: 1px solid var(--border); color: var(--text); font: 500 0.72rem 'Inter', sans-serif; letter-spacing: 0.2px; cursor: pointer;
+    transition: border-color 0.15s, background 0.15s; display: inline-flex; align-items: center; gap: 7px; }
+  .about-btn:hover { border-color: var(--accent); background: rgba(142,163,207,0.08); }
+  .about-btn svg { width: 13px; height: 13px; stroke: var(--accent); }
+  .about-veil { position: fixed; inset: 0; z-index: 50; background: rgba(5,7,10,0.72); display: none; align-items: center; justify-content: center; padding: 24px; }
+  .about-veil.open { display: flex; }
+  .about-card { width: min(760px, 100%); max-height: 86vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 14px; padding: 26px 30px 22px; box-shadow: 0 24px 70px rgba(0,0,0,0.6); }
+  .about-head { display: flex; align-items: center; gap: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border-soft); margin-bottom: 6px; }
+  .about-head img { height: 24px; }
+  .about-head h2 { font-size: 1.05rem; font-weight: 600; letter-spacing: 0.2px; }
+  .about-head p { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+  .about-x { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--muted); width: 28px; height: 28px; border-radius: 8px; cursor: pointer; font-size: 1rem; line-height: 1; }
+  .about-x:hover { color: var(--text); border-color: var(--accent); }
+  .about-card h3 { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted-2); font-weight: 600; margin: 18px 0 8px; }
+  .about-card p, .about-card li { font-size: 0.8rem; line-height: 1.55; color: #c9cfdb; }
+  .about-card ul { list-style: none; display: grid; gap: 6px; }
+  .about-card li { display: grid; grid-template-columns: 150px 1fr; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+  .about-card li b { color: var(--text); font-weight: 600; }
+  .about-card ol { padding-left: 18px; display: grid; gap: 5px; }
+  .about-credit { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border-soft); text-align: center; font-size: 0.72rem; color: var(--muted); letter-spacing: 0.3px; }
+  .about-credit b { color: var(--text); font-weight: 600; }
 </style>
 </head>
 <body>
 
 <header>
+  <button class="about-btn" onclick="openAbout()" title="About Physyk AI"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>About</button>
   <div class="logo">
     <img class="logo-ntt" src="ntt_data_logo.png" alt="NTT DATA">
     <span class="logo-sep"></span>
@@ -978,6 +1029,58 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 </header>
+
+<div class="about-veil" id="aboutVeil" onclick="if(event.target===this)closeAbout()">
+  <div class="about-card" role="dialog" aria-label="About Physyk AI">
+    <div class="about-head">
+      <img src="ntt_data_logo.png" alt="NTT DATA">
+      <div><h2>Physyk AI</h2><p>Plain-English pick-and-place for a simulated Franka Panda arm</p></div>
+      <button class="about-x" onclick="closeAbout()" aria-label="Close">&times;</button>
+    </div>
+
+    <h3>What it does</h3>
+    <p>You describe a task in plain language. Physyk plans the moves, finds the cubes by looking at camera images, runs the pick-and-place in NVIDIA Isaac Sim, and checks the real outcome before it reports success. A second AI model gives an independent visual opinion on every step.</p>
+
+    <h3>How a request flows</h3>
+    <ol>
+      <li><b>Plan.</b> "Stack ..." is planned by a local program from the cube positions. Anything else goes to Nemotron, which splits it into goals once and then proposes one move at a time against the live scene.</li>
+      <li><b>Guard.</b> Plain rules refuse any target outside the arm's safe reach.</li>
+      <li><b>Move.</b> NVIDIA's pick-and-place controller drives the arm through RMPFlow motion planning.</li>
+      <li><b>Verify.</b> The cube's real position is checked (simulator pose, or a fresh camera look in camera-only mode); Cosmos checks the picture in the background.</li>
+      <li><b>Adapt.</b> After every step the plan is re-made from the live scene, so a dropped or moved cube is handled.</li>
+    </ol>
+
+    <h3>Components</h3>
+    <ul>
+      <li><b>Isaac Sim 6.0.1</b><span>Physics at 60 Hz, overview and wrist cameras, runs headless in Docker.</span></li>
+      <li><b>Nemotron 3.5 Lightning 30B</b><span>Plans non-stacking requests (NVIDIA hosted API, thinking off, streamed).</span></li>
+      <li><b>Stack planner</b><span>Local and deterministic: decides the base cube, the order, and where blocking cubes go.</span></li>
+      <li><b>Cosmos 3 Nano Reasoner</b><span>Local NIM that confirms each step visually; evidence only, it never steers the arm.</span></li>
+      <li><b>Camera perception</b><span>Colour masks and depth locate the cubes in about 20 ms (the "Pure perception" switch).</span></li>
+      <li><b>Backend and GUI</b><span>FastAPI on port 7860, talking to the simulator on port 8100.</span></li>
+    </ul>
+
+    <h3>Using it</h3>
+    <ul>
+      <li><b>Instruction box</b><span>Type a task, for example "put the red cube in the tray" or "stack the cubes". Several steps can be chained with "then".</span></li>
+      <li><b>Send prompt to Agent</b><span>On: planned, guarded and verified. Off: the text goes straight to the simulator.</span></li>
+      <li><b>Pure perception</b><span>On: the arm works from the camera alone and boxes are drawn on the live view. Off: simulator positions.</span></li>
+      <li><b>Quick actions</b><span>Randomize the cubes, return the arm home, or reset the scene. Hard Reset stops everything.</span></li>
+      <li><b>Logs</b><span>The Nemotron, Cosmos and Perception pages show the full reasoning and the exact frames the models saw.</span></li>
+    </ul>
+
+    <h3>Good to know</h3>
+    <p>This is a simulation with three coloured cubes and a tray on a known table. Cubes are reachable between about 0.38 m and 0.66 m from the arm's base. The hand always points straight down and the grasp is timed rather than closed-loop, so very long sideways carries may overshoot.</p>
+
+    <div class="about-credit">Built by the <b>India Innovation Centre, NTT DATA</b></div>
+  </div>
+</div>
+<script>
+  function openAbout() { document.getElementById('aboutVeil').classList.add('open'); }
+  function closeAbout() { document.getElementById('aboutVeil').classList.remove('open'); }
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAbout(); });
+  if (location.hash === '#about') openAbout();
+</script>
 
 <div class="layout">
   <!-- VIEWPORT & TELEMETRY -->
@@ -1200,7 +1303,7 @@ HTML = """<!DOCTYPE html>
     const verified = !!step.visual_verified;
     let color, label;
     if (!enforced) { color = 'var(--muted)'; label = 'NOT CHECKED'; }
-    else if (verified) { color = '#7fb4c9'; label = 'VERIFIED'; }
+    else if (verified) { color = '#86b39d'; label = 'VERIFIED'; }
     else { color = '#b3a98f'; label = 'VISUAL CHECK DISAGREES'; }
     const conf = (enforced && step.visual_confidence != null) ? ` · conf ${step.visual_confidence}` : '';
     return `<div class="plan-step-detail" style="color:${color}; margin-top:4px;">
@@ -1242,8 +1345,11 @@ HTML = """<!DOCTYPE html>
   // summary here (the decision it made), full chain-of-thought on its own dashboard.
   function renderPlannerReasoning(step) {
     if (!step.planner_reasoning) return '';
+    const esc = (t) => String(t).replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+    // a move proposed step by step carries the model's one-sentence reason; a failure decision carries its reasoning text
+    const text = step.raw_answer ? esc(step.planner_reasoning) : 'Nemotron diagnosed this failure and chose how to proceed.';
     return `<div class="plan-step-detail" style="color:var(--muted); margin-top:4px;">
-      Nemotron diagnosed this failure and chose how to proceed.
+      ${step.raw_answer ? '<span style="color:#8ea3cf; font-weight:600;">NEMOTRON</span> ' : ''}${text}
       <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#8ea3cf;">View full reasoning</a>
     </div>`;
   }
@@ -1274,15 +1380,22 @@ HTML = """<!DOCTYPE html>
     // shown once, above the step list, so "the planner is thinking" is visible up front.
     if (plan.planning_reasoning) {
       const stepCount = (plan.steps || []).length;
+      const stepwise = Array.isArray(plan.milestones);
       html += `<div class="plan-step-detail" style="color:var(--muted); margin:6px 0 10px; padding:8px; border-left:2px solid #8ea3cf; background:rgba(142,163,207,0.06);">
-        <span style="font-weight:700; color:#8ea3cf;">NEMOTRON PLANNING</span> decomposed the request into ${stepCount} step${stepCount === 1 ? '' : 's'}.
+        <span style="font-weight:700; color:#8ea3cf;">NEMOTRON PLANNING</span> ${stepwise
+          ? `split the request into ${plan.milestones.length} goal${plan.milestones.length === 1 ? '' : 's'}; moves are planned one at a time (${stepCount} so far).`
+          : `decomposed the request into ${stepCount} step${stepCount === 1 ? '' : 's'}.`}
         <a href="${NEMOTRON_LOG_URL}" target="_blank" style="color:#8ea3cf;">View full reasoning</a>
       </div>`;
+    }
+    // Live token stream of the model's answer while it is being planned (a short JSON line, streamed as it is generated).
+    if (plan.planner_stream && plan.active) {
+      html += `<div class="plan-step-detail" style="color:var(--muted); margin:0 0 10px; padding:6px 8px; font-family:monospace; font-size:11px; border-left:2px solid #8ea3cf; opacity:0.85;">${plan.planner_stream.replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]))}</div>`;
     }
     const escHtml = (t) => t.replace(/[&<>"]/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
     if (plan.answer && !plan.active) {
       const bad = ['REJECTED', 'FAILED', 'PARTIAL'].includes(overall);
-      html += `<div class="plan-step-detail" style="margin:8px 0 10px; padding:9px 11px; font-weight:600; line-height:1.45; color:${bad ? '#dcbcc2' : '#bcd9e6'}; border-left:3px solid ${bad ? '#a97480' : '#7fb4c9'}; background:${bad ? 'rgba(169,116,128,0.14)' : 'rgba(127,180,201,0.10)'};">${escHtml(String(plan.answer))}</div>`;
+      html += `<div class="plan-step-detail" style="margin:8px 0 10px; padding:9px 11px; font-weight:600; line-height:1.45; color:${bad ? '#e3bcbb' : '#bfdccb'}; border-left:3px solid ${bad ? '#c4807f' : '#86b39d'}; background:${bad ? 'rgba(196,128,127,0.14)' : 'rgba(134,179,157,0.11)'};">${escHtml(String(plan.answer))}</div>`;
     }
     html += '<div class="plan-steps">';
     for (const step of (plan.steps || [])) {
@@ -1292,7 +1405,7 @@ HTML = """<!DOCTYPE html>
         <div class="plan-step-body">
           <div class="plan-step-text">${step.text || ''}</div>
           ${step.refused
-            ? `<div class="plan-step-detail" style="color:#dcbcc2; margin-top:6px; padding:8px 10px; border-left:3px solid #a97480; background:rgba(169,116,128,0.14); font-weight:600; line-height:1.45;">Failed: ${escHtml(String(step.detail || '').replace(/^refused by the robot: /, ''))}</div>`
+            ? `<div class="plan-step-detail" style="color:#e3bcbb; margin-top:6px; padding:8px 10px; border-left:3px solid #c4807f; background:rgba(196,128,127,0.14); font-weight:600; line-height:1.45;">Failed: ${escHtml(String(step.detail || '').replace(/^refused by the robot: /, ''))}</div>`
             : (step.detail ? `<div class="plan-step-detail">${step.detail}</div>` : '')}
           ${renderPlannerReasoning(step)}
           ${renderCosmosAssessment(step)}
@@ -1419,7 +1532,12 @@ HTML = """<!DOCTYPE html>
 
         const dot = document.getElementById('statusDot');
         const btn = document.getElementById('btnExecute');
-        if (data.busy) {
+        const simOffline = data.service_status && data.service_status.isaac_sim === false;
+        if (simOffline) {
+            dot.className = 'dot off';
+            document.getElementById('statusText').textContent = 'Sim offline';
+            btn.disabled = true;
+        } else if (data.busy) {
             dot.className = 'dot busy';
             document.getElementById('statusText').textContent = 'Sim busy';
             btn.disabled = true;

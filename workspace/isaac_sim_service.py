@@ -606,7 +606,7 @@ perception_camera_state = {
 # instruction, purely for logging a delta via /perception — zero effect on robot behavior
 # unless PERCEPTION_MODE=vision is explicitly set.
 from physyk_perception.provider import PerceptionProvider, PerceptionUnavailable
-from physyk_perception.overlay_layout import layout_labels
+from physyk_perception.overlay_layout import place_labels
 
 _PERCEPTION_LABEL_MAP = {
     "red_cube": "red cube", "blue_cube": "blue cube",
@@ -1255,6 +1255,16 @@ def get_perception_camera():
     with telemetry_lock:
         return JSONResponse(perception_camera_state)
 
+@api_app.get("/perception/dump.npz")
+def get_perception_dump():
+    """The overview camera's current RGB and depth frames as one .npz (for offline tuning of the detector on real data)."""
+    import io
+    from fastapi.responses import Response
+    rgb, depth = scene_annot.get_data(), scene_depth_annot.get_data()
+    buf = io.BytesIO()
+    np.savez_compressed(buf, rgb=np.asarray(rgb)[:, :, :3], depth=np.asarray(depth).astype(np.float32))
+    return Response(buf.getvalue(), media_type="application/octet-stream")
+
 @api_app.get("/perception")
 def get_perception():
     """Cosmos-Reason2 integration Step 5 — shadow-mode snapshot: the last grounding call's
@@ -1463,6 +1473,8 @@ _OVERLAY_BGR = {"red_cube": (60, 60, 255), "green_cube": (90, 230, 90), "blue_cu
                 "target_tray": (60, 220, 255)}
 
 
+_overlay_last = {}   # key -> (bbox, position, time) of the last sighting, for the overlay's brief 'hidden' hold
+
 _FIXED_EXTENTS = {"target_tray": (0.11, 0.12, 0.015)}   # half extents (m) of the tray FixedCuboid (scale 0.22 x 0.24 x 0.03)
 
 
@@ -1475,17 +1487,30 @@ def draw_perception_overlay(bgr):
               "shadow": "DETERMINISTIC (perception shadowing)", "stage": "DETERMINISTIC"}.get(mode, mode)
     banner_color = (100, 235, 140) if mode == "pure" else (200, 200, 200)
     cv2.putText(bgr, hud_text(banner), (14, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.5, banner_color, 1, cv2.LINE_AA)
-    items = []   # (key, padded box, label text)
+    items = []   # (key, box (x0, y0, x1, y1), label text, polygon or None)
+    now_t = time.time()
+    seen_now = set()
     for key, entry in (snap.get("objects") or {}).items():
         box = entry.get("bbox_px")
         pos = entry.get("vision_pos_m")
         if not box or pos is None:
             continue
+        seen_now.add(key)
+        _overlay_last[key] = (list(box), list(pos), now_t)
+    # A cube the arm hides for a moment keeps its last box for ~0.7 s, labelled "(hidden)" (overlay only; never used for control).
+    for key, (box, pos, t) in list(_overlay_last.items()):
+        if key in seen_now:
+            tag = ""
+        elif now_t - t <= 0.7:
+            tag = " (hidden)"
+        else:
+            del _overlay_last[key]
+            continue
         x0, y0, x1, y1 = box
         name = SCENE_OBJECTS[key]["name"].upper() if key in SCENE_OBJECTS else key
-        items.append((key, (x0 - 3, y0 - 3, x1 + 3, y1 + 3),
-                      hud_text(f"{name} ({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})")))
-    # Fixed-pose objects (the tray) are not detected, so they have no mask: draw the box of their known footprint.
+        items.append((key, (x0 - 2, y0 - 2, x1 + 2, y1 + 2),
+                      hud_text(f"{name}  {pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}{tag}"), None))
+    # Fixed-pose objects (the tray) are not detected, so they have no mask: outline the known footprint instead.
     from physyk_perception.deproject import project_world_to_pixel
     for key, fp in perception_provider.fixed_poses.items():
         info = SCENE_OBJECTS.get(key)
@@ -1497,27 +1522,33 @@ def draw_perception_overlay(bgr):
         px = [p for p in px if p is not None]
         if len(px) < 4:
             continue
-        us, vs = [p[0] for p in px], [p[1] for p in px]
-        items.append((key, (int(min(us)) - 3, int(min(vs)) - 3, int(max(us)) + 3, int(max(vs)) + 3),
-                      hud_text(f"{info['name'].upper()} ({fp[0]:.2f}, {fp[1]:.2f}, {fp[2]:.2f}) FIXED")))
+        hull = cv2.convexHull(np.array(px, dtype=np.float32)).astype(np.int32)
+        bx, by, bw, bh = cv2.boundingRect(hull)
+        items.append((key, (bx, by, bx + bw, by + bh), hud_text(f"{info['name'].upper()}  fixed"), hull))
     if not items:
         return bgr
-    font, scale = cv2.FONT_HERSHEY_SIMPLEX, 0.38
+    font, scale = cv2.FONT_HERSHEY_SIMPLEX, 0.36
     sizes = []
-    for _, _, text in items:
+    for _, _, text, _ in items:
         (tw, th), base = cv2.getTextSize(text, font, scale, 1)
-        sizes.append((tw, th + base))
-    # Labels go in a column beside the cluster (stacked cubes' boxes nearly coincide, so a label
-    # above each box would collide); leader lines tie each one back to its box.
+        sizes.append((tw + 2, th + base))
     h_img, w_img = bgr.shape[:2]
-    placed = layout_labels([b for _, b, _ in items], sizes, w_img, h_img)
-    for (key, box, text), lay in zip(items, placed):
+    # Plain thin rectangle round each object; its label sits right beside it (above, below, right or left, whichever is free) and
+    # only goes to a column with a short leader line when no free spot is left. The HUD text at top left is kept clear.
+    placed = place_labels([b for _, b, _, _ in items], sizes, w_img, h_img, reserved=[(0, 0, 360, 90)],
+                         priority=[1 if poly is not None else 0 for _, _, _, poly in items])
+    for (key, box, text, poly), lay in zip(items, placed):
         color = _OVERLAY_BGR.get(key, (255, 255, 255))
-        cv2.rectangle(bgr, (box[0], box[1]), (box[2], box[3]), color, 1, cv2.LINE_AA)
-        lx = lay["label_x"] - 3 if lay["side"] == "right" else lay["label_x"] + sizes[items.index((key, box, text))][0] + 3
-        cv2.line(bgr, lay["anchor"], (lx, lay["label_mid_y"]), color, 1, cv2.LINE_AA)
-        cv2.putText(bgr, text, lay["text_xy"], font, scale, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(bgr, text, lay["text_xy"], font, scale, color, 1, cv2.LINE_AA)
+        if poly is not None:
+            cv2.polylines(bgr, [poly], True, color, 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(bgr, (box[0], box[1]), (box[2], box[3]), color, 1, cv2.LINE_AA)
+        if lay["leader"] is not None:
+            cv2.line(bgr, lay["leader"][0], lay["leader"][1], color, 1, cv2.LINE_AA)
+        rx0, ry0, rx1, ry1 = lay["rect"]
+        org = (rx0 + 1, ry1 - 3)
+        cv2.putText(bgr, text, org, font, scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(bgr, text, org, font, scale, color, 1, cv2.LINE_AA)
     return bgr
 
 
@@ -1914,9 +1945,9 @@ try:
                 _last_live_perception = time.time()
 
             # Live perception readout: in pure mode, re-localize the cubes from the camera every
-            # 0.5-1 s (colour detector only, a few ms) so /state and the overlay follow the scene.
+            # 0.15-0.3 s, also while the arm moves (colour detector only, a few ms) so /state and the overlay follow the scene.
             # With the switch off nothing extra runs.
-            _live_period = 1.0 if sim_telemetry["busy"] else 0.5
+            _live_period = 0.15 if sim_telemetry["busy"] else 0.3
             if (perception_provider.mode == "pure" and perception_provider.detector == "color"
                     and time.time() - _last_live_perception >= _live_period):
                 _last_live_perception = time.time()
