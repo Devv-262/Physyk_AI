@@ -1,0 +1,7 @@
+# Backend + GUI (system Python 3.12, a venv). The Isaac Sim service uses Isaac Sim's own Python; see SETUP_WINDOWS.md §7.
+fastapi
+uvicorn[standard]
+httpx
+opencv-python-headless
+numpy
+pillow
